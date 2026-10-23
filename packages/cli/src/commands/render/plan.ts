@@ -450,7 +450,8 @@ export function createRenderPlan(args: RenderCommandArgs, now = new Date()): Ren
     : join(rendersDir, `${project.name}_${timestamp}${ext}`);
 
   const useDocker = args.docker ?? false;
-  const useGpu = args.gpu ?? false;
+  // `--gpu` / `--no-gpu` win; otherwise HYPERFRAMES_GPU_ENCODE=1 makes GPU encoding the default.
+  const useGpu = args.gpu ?? process.env.HYPERFRAMES_GPU_ENCODE === "1";
   const browserGpuMode = resolveBrowserGpuForCli(useDocker, args["browser-gpu"]);
   if (useDocker && args["browser-gpu"] === true) {
     errorBox(

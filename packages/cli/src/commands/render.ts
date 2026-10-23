@@ -252,7 +252,11 @@ export default defineCommand({
       description:
         "libvpx-vp9 -cpu-used value for WebM encodes (-8 to 8). Higher is faster with a larger quality/size tradeoff. Env: PRODUCER_VP9_CPU_USED.",
     },
-    gpu: { type: "boolean", description: "Use GPU encoding", default: false },
+    // No citty default: an absent flag stays undefined so HYPERFRAMES_GPU_ENCODE can apply.
+    gpu: {
+      type: "boolean",
+      description: "Use GPU encoding (default: off, or on when HYPERFRAMES_GPU_ENCODE=1)",
+    },
     "browser-gpu": {
       type: "boolean",
       description:

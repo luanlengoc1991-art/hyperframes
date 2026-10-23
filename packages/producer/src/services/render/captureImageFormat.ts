@@ -23,7 +23,15 @@ export function resolveCaptureImageFormat(input: {
 /**
  * Below 100, Chrome's JPEG turns graded colour and grain into 8x8 chroma blotches that survive
  * the final encode. Draft keeps the smaller, faster frames.
+ *
+ * `HYPERFRAMES_CAPTURE_JPEG_QUALITY` (1-100) overrides the non-draft value for hosts where
+ * quality-100 frames make capture the bottleneck; unset keeps 100.
  */
-export function resolveCaptureJpegQuality(quality: EngineConfig["quality"]): number {
-  return quality === "draft" ? 80 : 100;
+export function resolveCaptureJpegQuality(
+  quality: EngineConfig["quality"],
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  if (quality === "draft") return 80;
+  const override = Number(env.HYPERFRAMES_CAPTURE_JPEG_QUALITY);
+  return Number.isInteger(override) && override >= 1 && override <= 100 ? override : 100;
 }

@@ -37,4 +37,19 @@ describe("resolveCaptureJpegQuality", () => {
   it("keeps draft renders on the smaller, faster frames", () => {
     expect(resolveCaptureJpegQuality("draft")).toBe(80);
   });
+
+  it("lets HYPERFRAMES_CAPTURE_JPEG_QUALITY lower non-draft frames", () => {
+    const env = { HYPERFRAMES_CAPTURE_JPEG_QUALITY: "92" };
+    expect(resolveCaptureJpegQuality("standard", env)).toBe(92);
+    expect(resolveCaptureJpegQuality("high", env)).toBe(92);
+    expect(resolveCaptureJpegQuality("draft", env)).toBe(80);
+  });
+
+  it("ignores an out-of-range or non-numeric override", () => {
+    for (const value of ["0", "101", "abc", "92.5", ""]) {
+      expect(
+        resolveCaptureJpegQuality("standard", { HYPERFRAMES_CAPTURE_JPEG_QUALITY: value }),
+      ).toBe(100);
+    }
+  });
 });

@@ -169,7 +169,9 @@ export function registerRenderRoutes(api: Hono, adapter: StudioApiAdapter): void
       composition,
       variables,
       ...encoder.options,
-      useGpu: body.gpu === true && format === "mp4",
+      // HYPERFRAMES_GPU_ENCODE=1 lets a host (e.g. a desktop wrapper) make hardware
+      // encoding the default for every Studio export; a missing encoder still falls back.
+      useGpu: (body.gpu === true || process.env.HYPERFRAMES_GPU_ENCODE === "1") && format === "mp4",
       distinctId:
         typeof body.telemetryDistinctId === "string" ? body.telemetryDistinctId : undefined,
       telemetryOptOut: body.telemetryOptOut === true,

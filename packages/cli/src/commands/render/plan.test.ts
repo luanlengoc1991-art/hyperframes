@@ -115,6 +115,15 @@ describe("createRenderPlan", () => {
     expect(plan.bestEffort).toBe(false);
   });
 
+  it("defaults GPU encoding from HYPERFRAMES_GPU_ENCODE unless --gpu/--no-gpu is given", () => {
+    vi.stubEnv("HYPERFRAMES_GPU_ENCODE", "");
+    expect(createRenderPlan({ dir: projectDir }).useGpu).toBe(false);
+    vi.stubEnv("HYPERFRAMES_GPU_ENCODE", "1");
+    expect(createRenderPlan({ dir: projectDir }).useGpu).toBe(true);
+    expect(createRenderPlan({ dir: projectDir, gpu: false }).useGpu).toBe(false);
+    vi.unstubAllEnvs();
+  });
+
   it("preserves an aspect-agnostic resolution alias through the execution plan", () => {
     const plan = createRenderPlan({ dir: projectDir, resolution: "1080p" });
     expect(plan.outputResolution).toBe("landscape");
