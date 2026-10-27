@@ -36,7 +36,7 @@ const safeWrite = (p, s) => {
 if (!existsSync(briefPath)) err('No brief found: ' + briefPath);
 const brief = JSON.parse(readFileSync(briefPath, 'utf8'));
 if (!Array.isArray(brief.scenes) || !brief.scenes.length) err('scenes must be nonempty');
-if (brief.aspect && !['9:16','16:9'].includes(brief.aspect)) fail('Invalid aspect; expected 9:16 or 16:9');
+if (brief.aspect && !['9:16','16:9'].includes(brief.aspect)) err('Invalid aspect; expected 9:16 or 16:9');
 const width = brief.aspect === '16:9' ? 1920 : 1080;
 const height = brief.aspect === '16:9' ? 1080 : 1920;
 const fps = brief.fps ?? 30;
