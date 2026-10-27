@@ -1,0 +1,20 @@
+#!/usr/bin/env node
+import {existsSync,readFileSync,writeFileSync} from 'node:fs';
+import {resolve,join} from 'node:path';
+import {spawnSync} from 'node:child_process';
+const a=process.argv.slice(2),i=a.indexOf('--project');
+if(i<0||!a[i+1])throw Error('Supply --project <path>');
+const project=resolve(a[i+1]),v=a.indexOf('--video'),video=resolve(project,v>=0?a[v+1]:'out.mp4');
+if(!existsSync(video)||!existsSync(join(project,'tvc-plan.json')))throw Error('Missing MP4 or tvc-plan.json');
+const plan=JSON.parse(readFileSync(join(project,'tvc-plan.json'),'utf8'));
+const p=spawnSync('ffprobe',['-v','error','-print_format','json','-show_streams','-show_format',video],{encoding:'utf8'});
+if(p.error||p.status!==0)throw Error(p.stderr||'ffprobe failed');
+const meta=JSON.parse(p.stdout),stream=meta.streams.find(s=>s.codec_type==='video');
+if(!stream)throw Error('Missing video stream');
+const wh=plan.aspect==='16:9'?[1920,1080]:[1080,1920],duration=Number(meta.format.duration),errors=[];
+if(stream.width!==wh[0]||stream.height!==wh[1])errors.push('Dimensions do not match '+wh.join('x'));
+if(!Number.isFinite(duration)||Math.abs(duration-plan.duration)>.35)errors.push('Duration mismatch');
+const report={video,duration,expectedDuration:plan.duration,videoCodec:stream.codec_name,resolution:[stream.width,stream.height],hasAudio:meta.streams.some(s=>s.codec_type==='audio'),errors,manualGates:['Inspect start/middle/end frames','Listen to audio','Verify property facts and licensing']};
+writeFileSync(join(project,'verify-report.json'),JSON.stringify(report,null,2)+'\n');
+console.log(JSON.stringify(report,null,2));
+if(errors.length)process.exitCode=1;

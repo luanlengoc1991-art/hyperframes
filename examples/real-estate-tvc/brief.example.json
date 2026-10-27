@@ -1,0 +1,33 @@
+{
+  "title": "TVC bất động sản - demo (chỉ dùng media được cấp phép)",
+  "aspect": "9:16",
+  "fps": 30,
+  "music": "assets/music-bed.wav",
+  "musicVolume": 0.17,
+  "scenes": [
+    {
+      "id": "intro",
+      "title": "MỘT GÓC NHÌN MỚI",
+      "subtitle": "Cảnh quay thực tế của dự án",
+      "media": "assets/flycam-intro.mp4",
+      "voice": "assets/voice-intro.wav",
+      "narration": "Khám phá không gian sống với một góc nhìn mới.",
+      "caption": "Một góc nhìn mới"
+    },
+    {
+      "id": "living",
+      "title": "KHÔNG GIAN SỐNG",
+      "subtitle": "Chỉ nêu tiện ích được nguồn xác thực",
+      "media": "assets/lifestyle.jpg",
+      "duration": 5,
+      "caption": "Không gian sống",
+      "claims": []
+    },
+    {
+      "id": "outro",
+      "title": "KẾT NỐI ĐỂ TÌM HIỂU",
+      "media": "assets/outro.jpg",
+      "duration": 3
+    }
+  ]
+}
