@@ -75,3 +75,38 @@ Mỗi phase có code chạy được, kiểm thử bằng footage thật, và đ
 | 7 | Thiết kế backend + Render Worker cho 50–100 sale | Tài liệu kiến trúc | Phase 6 ổn định |
 
 Orchestrator lưu `pipeline.json` (trạng thái từng công đoạn), nên chạy lại chỉ làm lại công đoạn lỗi và các công đoạn sau nó.
+
+## 3. Bổ sung theo Master Prompt V7 (app Windows, nhiều người dùng)
+
+### Môi trường cho V7 (máy này)
+
+| Thứ | Kết quả |
+|---|---|
+| Rust (`cargo`, `rustc`, `rustup`) | Có — build được Tauri 2 |
+| Visual Studio Build Tools 2022 (MSVC) | Có — Tauri cần cho Windows |
+| WebView2 | Có (Windows 11) |
+| `wrangler` (Cloudflare) | Chưa cài; gọi qua `npx wrangler` được |
+| `ANTHROPIC_API_KEY` | Chưa có — app cho Sale cần Claude API qua backend |
+| Token Cloudflare | Chưa có — chưa triển khai được Workers/D1/R2/Queues |
+| MCP đã cài cho Claude Code | `artcraft` (+ Vbee có mã trong repo, chưa đăng ký, chưa có key) |
+
+### Cấu trúc đề xuất (bên cạnh HyperFrames, không sửa `packages/`)
+
+```
+luan/
+  orchestrator/   Bộ điều phối 14 công đoạn (Node, gọi ffmpeg + CLI hyperframes)   ← đang làm
+  skills/         Skill Registry: định nghĩa skill có schema, quyền, chi phí, timeout
+  desktop/        App Windows: Tauri 2 + React + TypeScript; nhúng HyperFrames Studio cho chế độ nâng cao
+  backend/        Cloudflare Workers + D1 + R2 + Queues; gọi Claude API; giữ mọi secret
+  render-worker/  Máy render: nhận job từ Queue, chạy orchestrator + hyperframes render, báo tiến độ
+```
+
+Máy Sale chỉ cài app `desktop/`; không cần FFmpeg, HyperFrames hay Claude Code. Render chạy trên `render-worker/`.
+
+### Tiến độ theo roadmap V7
+
+| Phase V7 | Trạng thái |
+|---|---|
+| 1. Source audit | Xong (báo cáo này) |
+| 2. Autonomous pipeline | Đang làm — xong công đoạn 1–3 (nhập, phân tích footage, transcript) có kiểm thử; tiếp theo: EDL + smart cut không phá huỷ |
+| 3–9 | Chưa bắt đầu |
