@@ -53,7 +53,7 @@ Mục tiêu: một câu lệnh, Claude điều phối, HyperFrames dựng TVC ho
 
 | Thứ | Trạng thái trên máy này | Gỡ bằng cách |
 |---|---|---|
-| `whisper-cli` (transcript tiếng Việt) | Chưa có | Tải bản build sẵn cho Windows của whisper.cpp (miễn phí) |
+| `whisper-cli` (transcript tiếng Việt) | Đã cài (whisper.cpp b5454, BLAS x64) vào `~/.local/bin` | — |
 | Giọng AI tiếng Việt | Không có key HeyGen / ElevenLabs / Vbee. Kokoro chưa cài và không có tiếng Việt | Cần bạn duyệt một nhà cung cấp trả phí và nhập key; nếu không thì chỉ dùng giọng gốc trong video |
 | Tạo nhạc nền | Không có key | Dùng nhạc của bạn hoặc thư viện nội bộ |
 | Python | Chỉ có `uv`, chưa có Python | Không bắt buộc (ffmpeg làm được phần phân tích) |
@@ -87,7 +87,7 @@ Orchestrator lưu `pipeline.json` (trạng thái từng công đoạn), nên ch�
 | WebView2 | Có (Windows 11) |
 | `wrangler` (Cloudflare) | Chưa cài; gọi qua `npx wrangler` được |
 | `ANTHROPIC_API_KEY` | Chưa có — app cho Sale cần Claude API qua backend |
-| Token Cloudflare | Chưa có — chưa triển khai được Workers/D1/R2/Queues |
+| Cloudflare | Đã đăng nhập wrangler (OAuth) — đủ quyền Workers, D1, R2, Queues; chưa tạo tài nguyên nào cho dự án này |
 | MCP đã cài cho Claude Code | `artcraft` (+ Vbee có mã trong repo, chưa đăng ký, chưa có key) |
 
 ### Cấu trúc đề xuất (bên cạnh HyperFrames, không sửa `packages/`)
@@ -108,5 +108,5 @@ Máy Sale chỉ cài app `desktop/`; không cần FFmpeg, HyperFrames hay Claude
 | Phase V7 | Trạng thái |
 |---|---|
 | 1. Source audit | Xong (báo cáo này) |
-| 2. Autonomous pipeline | Đang làm — xong công đoạn 1–3 (nhập, phân tích footage, transcript) có kiểm thử; tiếp theo: EDL + smart cut không phá huỷ |
+| 2. Autonomous pipeline | Đang làm — xong công đoạn 1–3 (nhập, phân tích footage, transcript tiếng Việt chạy thật trên footage Dự án 1) và module giọng đọc Vbee/ElevenLabs; tiếp theo: EDL + smart cut không phá huỷ |
 | 3–9 | Chưa bắt đầu |

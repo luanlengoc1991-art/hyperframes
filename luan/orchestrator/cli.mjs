@@ -3,9 +3,13 @@
 //
 //   node luan/orchestrator/cli.mjs analyze --project <dir> --sources <path>[,<path>...] [--model small]
 //   node luan/orchestrator/cli.mjs status  --project <dir>
+//   node luan/orchestrator/cli.mjs voice-status
+//   node luan/orchestrator/cli.mjs voices  --provider vbee|elevenlabs
+//   node luan/orchestrator/cli.mjs voice   --text "..." | --text-file <f> --out <file.mp3>
+//                                          [--provider auto|vbee|elevenlabs] [--voice <id>] [--dry-run]
 //
 // State lives in <project>/pipeline.json: a re-run skips finished work and resumes where it stopped.
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Pipeline } from "./lib/pipeline.mjs";
@@ -13,6 +17,7 @@ import { analyzeItem } from "./stages/analyze.mjs";
 import { ingest } from "./stages/ingest.mjs";
 import { writeReport } from "./stages/report.mjs";
 import { transcribeItem } from "./stages/transcribe.mjs";
+import * as voice from "../voice/index.mjs";
 
 function args(argv) {
   const out = { _: [] };
@@ -89,12 +94,33 @@ if (isMain) {
       if (!a.project) throw new Error("Cần --project");
       for (const [name, s] of Object.entries(status(a.project).stages))
         console.log(`${s.status.padEnd(8)} ${name}${s.error ? ` — ${s.error}` : ""}`);
+    } else if (cmd === "voice-status") {
+      console.log(JSON.stringify(voice.status(), null, 2));
+    } else if (cmd === "voices") {
+      if (!a.provider) throw new Error("Cần --provider vbee|elevenlabs");
+      for (const v of await voice.listVoices(a.provider))
+        console.log(`${v.id}\t${v.name}\t${v.gender ?? ""}\t${v.language ?? ""}`);
+    } else if (cmd === "voice") {
+      const text = a["text-file"] ? readFileSync(a["text-file"], "utf8") : a.text;
+      if (!text || !a.out) throw new Error("Cần --text (hoặc --text-file) và --out");
+      const r = await voice.synthesize({
+        text: String(text),
+        out: resolve(a.out),
+        provider: a.provider || "auto",
+        voice: a.voice,
+        dryRun: Boolean(a["dry-run"]),
+      });
+      // Word timings (ElevenLabs) sit next to the audio for captions and ducking.
+      if (r.words?.length) writeFileSync(`${r.file}.words.json`, JSON.stringify(r.words, null, 2));
+      console.log(JSON.stringify({ ...r, words: r.words ? r.words.length : null }, null, 2));
     } else {
-      console.log("Lệnh: analyze --project <dir> --sources <path,...> | status --project <dir>");
+      console.log(
+        "Lệnh: analyze | status | voice-status | voices --provider <p> | voice --text <t> --out <f> [--dry-run]",
+      );
       process.exitCode = 1;
     }
   } catch (error) {
-    console.error(`Lỗi: ${error.message}`);
+    console.error(`${error.name === "BlockedError" ? "Chưa chạy được" : "Lỗi"}: ${error.message}`);
     process.exitCode = 1;
   }
 }

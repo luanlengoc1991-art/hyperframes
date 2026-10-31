@@ -1,0 +1,3 @@
+# Secrets stay on this machine only
+.env.local
+.env
