@@ -21,10 +21,18 @@ async function json(url, init, timeoutMs = 60_000) {
   return JSON.parse(body);
 }
 
-export async function listVoices({ language = "vi-VN" } = {}) {
-  const url = `${VOICES_API}?language_code=${encodeURIComponent(language)}&limit=100`;
-  const j = await json(url, {});
-  const list = j.result?.voices || j.voices || j.result || [];
+// The voices endpoint needs the same credentials as TTS (it answers 401 without them).
+export async function listVoices({ language = "vi-VN", ownership = "VBEE" } = {}) {
+  const s = creds();
+  const q = new URLSearchParams({
+    voiceOwnership: ownership,
+    languageCode: language,
+    limit: "100",
+  });
+  const j = await json(`${VOICES_API}?${q}`, {
+    headers: { Authorization: `Bearer ${s.token}`, "App-Id": s.appId },
+  });
+  const list = j.result?.voices || j.voices || [];
   return list.map((v) => ({
     id: v.code,
     name: v.name,

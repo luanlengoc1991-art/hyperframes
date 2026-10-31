@@ -121,6 +121,40 @@ test("vbee: create, poll until done, download", async () => {
   assert.ok(polls >= 2);
 });
 
+test("vbee: voice list is authenticated and filtered to Vietnamese stock voices", async () => {
+  process.env.VBEE_APP_ID = "app-2";
+  process.env.VBEE_TOKEN = "tok-2";
+  fakeFetch([
+    {
+      match: (u) => u.startsWith("https://vbee.vn/api/public/v1/voices?"),
+      respond: () =>
+        jsonRes({
+          result: {
+            voices: [
+              { code: "hn_female_x", name: "Ngọc Huyền", gender: "female", languageCode: "vi-VN" },
+            ],
+          },
+        }),
+    },
+  ]);
+  const vbee = await import("../vbee.mjs");
+  const list = await vbee.listVoices();
+  assert.deepEqual(list, [
+    { id: "hn_female_x", name: "Ngọc Huyền", gender: "female", language: "vi-VN" },
+  ]);
+  const url = new URL(calls[0].url);
+  assert.equal(url.searchParams.get("languageCode"), "vi-VN");
+  assert.equal(url.searchParams.get("voiceOwnership"), "VBEE");
+  assert.equal(calls[0].init.headers["App-Id"], "app-2");
+});
+
+test("vbee: voice list without keys is blocked before any call", async () => {
+  fakeFetch([]);
+  const vbee = await import("../vbee.mjs");
+  await assert.rejects(vbee.listVoices(), { name: "BlockedError" });
+  assert.equal(calls.length, 0);
+});
+
 test("elevenlabs: with-timestamps, Vietnamese model, words returned", async () => {
   process.env.ELEVENLABS_API_KEY = "xi-key";
   process.env.ELEVENLABS_VOICE_ID = "voice-9";
