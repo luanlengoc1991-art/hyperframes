@@ -44,6 +44,7 @@ function send(res, status, body) {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
     "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Private-Network": "true",
   });
   res.end(JSON.stringify(body));
 }
@@ -75,7 +76,16 @@ const MIME = {
   ".md": "text/markdown; charset=utf-8",
   ".mp3": "audio/mpeg",
   ".wav": "audio/wav",
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon",
 };
+
+// The desktop UI is served from here too, so the app window talks to one origin
+// (WebView2 blocks pages from its own scheme calling 127.0.0.1).
+const UI_DIR = resolve(process.env.LUAN_UI_DIR || join(REPO, "luan", "desktop", "dist"));
 
 function serveFile(req, res, file) {
   if (!file || !existsSync(file) || !statSync(file).isFile())
@@ -87,6 +97,7 @@ function serveFile(req, res, file) {
     "Content-Type": type,
     "Accept-Ranges": "bytes",
     "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Private-Network": "true",
   };
   if (range) {
     const start = range[1] ? Number(range[1]) : 0;
@@ -129,8 +140,9 @@ function projectInfo(id) {
     ? readdirSync(rendersDir)
         .filter((f) => f.endsWith(".mp4"))
         .map((f) => ({
-          file: `renders/${f}`,
           ...readJson(join(rendersDir, f.replace(/\.mp4$/, ".json")), {}),
+          // Relative to the project (the sidecar JSON holds an absolute path).
+          file: `renders/${f}`,
           mtime: statSync(join(rendersDir, f)).mtimeMs,
         }))
         .sort((a, b) => b.mtime - a.mtime)
@@ -172,7 +184,26 @@ function projectInfo(id) {
 function listProjects() {
   return readdirSync(PROJECTS, { withFileTypes: true })
     .filter((d) => d.isDirectory() && existsSync(join(PROJECTS, d.name, "project.json")))
-    .map((d) => projectInfo(d.name))
+    .map((d) => {
+      // One damaged project file must not hide every other project.
+      try {
+        return projectInfo(d.name);
+      } catch (error) {
+        return {
+          id: d.name,
+          name: d.name,
+          sources: [],
+          brief: null,
+          stages: {},
+          report: null,
+          edl: null,
+          hasComposition: false,
+          renders: [],
+          updatedAt: 0,
+          error: String(error?.message || error),
+        };
+      }
+    })
     .sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
@@ -382,6 +413,7 @@ export const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Private-Network": "true",
       "Access-Control-Allow-Methods": "GET,POST,PUT",
       "Access-Control-Allow-Headers": "Content-Type",
     });
@@ -510,6 +542,7 @@ export const server = http.createServer(async (req, res) => {
         "Cache-Control": "no-cache",
         Connection: "keep-alive",
         "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Private-Network": "true",
       });
       for (const e of job.log) res.write(`data: ${JSON.stringify(e)}\n\n`);
       if (job.status === "running") job.listeners.add(res);
@@ -547,6 +580,12 @@ export const server = http.createServer(async (req, res) => {
     m = /^\/files\/([^/]+)\/(.+)$/.exec(p);
     if (req.method === "GET" && m && SLUG.test(m[1]))
       return serveFile(req, res, inside(projectDir(m[1]), m[2]));
+    if (req.method === "GET" && !p.startsWith("/api/")) {
+      const file = inside(UI_DIR, p === "/" ? "index.html" : p.slice(1));
+      if (file && existsSync(file) && statSync(file).isFile()) return serveFile(req, res, file);
+      if (existsSync(join(UI_DIR, "index.html")))
+        return serveFile(req, res, join(UI_DIR, "index.html"));
+    }
     send(res, 404, { error: "Không tìm thấy" });
   } catch (error) {
     send(res, error?.name === "BlockedError" ? 409 : 500, {

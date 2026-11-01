@@ -15,7 +15,8 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const ENGINE_PORT: u16 = 4500;
 // Local mode: the engine lives in the HyperFrames checkout on this machine. Override with
 // LUAN_ENGINE_SCRIPT, or engine.json {"script": "..."} in the app's config folder.
-const DEFAULT_ENGINE: &str = r"D:\CLAUDE CURSO WEBSITE LUAN\hyperfarems\hyperframes\luan\engine\server.mjs";
+const DEFAULT_ENGINE: &str =
+    r"D:\CLAUDE CURSO WEBSITE LUAN\hyperfarems\hyperframes\luan\engine\server.mjs";
 
 struct EngineState(Mutex<Option<Child>>);
 
@@ -80,7 +81,9 @@ fn start_engine(app: &tauri::AppHandle) -> Result<Option<Child>, String> {
     }
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
-    let child = cmd.spawn().map_err(|e| format!("Không chạy được engine: {e}"))?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("Không chạy được engine: {e}"))?;
     Ok(Some(child))
 }
 
@@ -125,6 +128,22 @@ pub fn run() {
                 }
                 Err(e) => eprintln!("{e}"),
             }
+            // Once the engine answers, load the UI it serves: one origin for page and API.
+            std::thread::spawn(move || {
+                for _ in 0..120 {
+                    if engine_up() {
+                        if let Some(win) = handle.get_webview_window("main") {
+                            if let Ok(url) =
+                                tauri::Url::parse(&format!("http://127.0.0.1:{ENGINE_PORT}/"))
+                            {
+                                let _ = win.navigate(url);
+                            }
+                        }
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            });
             Ok(())
         })
         .build(tauri::generate_context!())

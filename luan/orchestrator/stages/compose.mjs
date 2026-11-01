@@ -31,23 +31,35 @@ export const DEFAULT_BRIEF = {
   captions: true,
 };
 
-/** Split a word transcript into sentences at . ? ! and drop filler-only words. */
+const MAX_WORDS = 24;
+const MAX_SECONDS = 9;
+const PAUSE_SPLIT = 0.45;
+
+/**
+ * Split a word transcript into editable sentences: at . ? !, at a pause longer than
+ * PAUSE_SPLIT, and never longer than MAX_WORDS / MAX_SECONDS (ASR often skips punctuation).
+ * Filler words and ASR hallucinations (one letter repeated 5+ times) are dropped.
+ */
 export function sentencesOf(words) {
   const out = [];
   let cur = [];
+  const flush = () => {
+    if (cur.length) out.push(cur);
+    cur = [];
+  };
   for (const w of words) {
     const bare = w.text
       .toLowerCase()
       .replace(/[.,!?…]/g, "")
       .trim();
-    if (!bare || FILLERS.has(bare)) continue;
+    if (!bare || FILLERS.has(bare) || /(.)\1{4,}/u.test(bare)) continue;
+    const prev = cur[cur.length - 1];
+    if (prev && w.start - prev.end > PAUSE_SPLIT) flush();
     cur.push(w);
-    if (/[.?!…]$/.test(w.text)) {
-      out.push(cur);
-      cur = [];
-    }
+    const long = cur.length >= MAX_WORDS || w.end - cur[0].start >= MAX_SECONDS;
+    if (/[.?!…]$/.test(w.text) || long) flush();
   }
-  if (cur.length) out.push(cur);
+  flush();
   return out;
 }
 

@@ -27,6 +27,20 @@ test("sentences split at punctuation and drop fillers", () => {
   );
 });
 
+test("long unpunctuated speech splits at pauses and length; hallucinations dropped", () => {
+  const run = [];
+  for (let i = 0; i < 30; i++) run.push(w(`từ${i}`, i * 0.3, i * 0.3 + 0.25)); // 30 words, no punctuation
+  run.push(w("tiếp", 10.0, 10.3)); // after a 0.95 s pause
+  run.push(w("Yayyyyyyy", 10.4, 12.0));
+  const s = sentencesOf(run);
+  assert.ok(
+    s.every((x) => x.length <= 24),
+    "no sentence over 24 words",
+  );
+  assert.equal(s[s.length - 1][0].text, "tiếp", "a long pause starts a new sentence");
+  assert.ok(!s.flat().some((x) => /yyyyy/.test(x.text)), "hallucinated word removed");
+});
+
 test("EDL rows are padded, never overlap the next sentence, all kept by default", () => {
   const edl = buildEdl([item], { "clip-a": words });
   assert.equal(edl.length, 3);

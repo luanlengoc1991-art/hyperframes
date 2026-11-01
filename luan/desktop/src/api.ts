@@ -1,5 +1,6 @@
 // Client for the local engine (luan/engine/server.mjs).
-export const ENGINE = "http://127.0.0.1:4500";
+// Served by the engine itself in the app (same origin); the Vite dev server calls it directly.
+export const ENGINE = location.port === "4500" ? location.origin : "http://127.0.0.1:4500";
 
 export interface MediaItem {
   id: string;

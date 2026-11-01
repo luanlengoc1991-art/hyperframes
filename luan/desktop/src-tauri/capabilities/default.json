@@ -3,6 +3,7 @@
   "identifier": "default",
   "description": "Main window: folder picker and opening files/links",
   "windows": ["main"],
+  "remote": { "urls": ["http://127.0.0.1:4500/*", "http://127.0.0.1:4500"] },
   "permissions": [
     "core:default",
     "dialog:allow-open",

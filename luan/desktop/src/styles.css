@@ -408,6 +408,10 @@ table.edl {
   font-weight: 600;
   font-size: 12px;
 }
+.edl td.mono,
+.edl td:nth-child(2) {
+  white-space: nowrap;
+}
 .edl tr.dropped td {
   opacity: 0.4;
   text-decoration: line-through;
