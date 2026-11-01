@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // LUAN AI Video Studio — local engine. The desktop app talks to this HTTP API on 127.0.0.1;
-// it drives the orchestrator (analyze → compose → validate → render), HyperFrames Studio,
-// voice-over and Claude. Local mode for this machine; the multi-user backend comes later.
+// it drives the orchestrator (analyze → storyboard → compose → validate → render), the live
+// preview, the storyboard editor, HyperFrames Studio, the sound library, voice-over and Claude.
+// Local mode for this machine; the multi-user backend comes later.
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
@@ -10,17 +11,22 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import http from "node:http";
-import { homedir } from "node:os";
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { analyze } from "../orchestrator/cli.mjs";
+import { findClaude, runClaude } from "../orchestrator/lib/claude.mjs";
 import { Pipeline } from "../orchestrator/lib/pipeline.mjs";
 import { findTool, firstJsonObject, hyperframes } from "../orchestrator/lib/proc.mjs";
-import { compose } from "../orchestrator/stages/compose.mjs";
+import { ensureProxies, ensureProxy, proxyReady } from "../orchestrator/lib/proxy.mjs";
+import { listSounds, SOUND_LIBRARY, soundPath } from "../orchestrator/lib/sounds.mjs";
+import { compose, readStory } from "../orchestrator/stages/compose.mjs";
+import { sanitizeStory } from "../orchestrator/stages/motion.mjs";
+import { planStory } from "../orchestrator/stages/plan.mjs";
 import { render, validate } from "../orchestrator/stages/render.mjs";
 import { whisperAvailable } from "../orchestrator/stages/transcribe.mjs";
 import { ENV_FILE, loadEnv } from "../voice/config.mjs";
@@ -33,18 +39,23 @@ const STUDIO_ROOT = resolve(
   process.env.LUAN_STUDIO_ROOT || "D:/CLAUDE CURSO WEBSITE LUAN/LUAN AI VIDEO STUDIO",
 );
 const PROJECTS = join(STUDIO_ROOT, "_projects");
+const TRASH = join(STUDIO_ROOT, "_trash");
 const SLUG = /^[a-z0-9][a-z0-9-]{0,62}$/;
 mkdirSync(PROJECTS, { recursive: true });
 loadEnv();
 
 // ---------- helpers ----------
 
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Private-Network": "true",
+};
+
 function send(res, status, body) {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Private-Network": "true",
+    ...CORS,
   });
   res.end(JSON.stringify(body));
 }
@@ -53,13 +64,14 @@ async function readBody(req) {
   let s = "";
   for await (const c of req) {
     s += c;
-    if (s.length > 2e6) throw new Error("Dữ liệu gửi lên quá lớn");
+    if (s.length > 4e6) throw new Error("Dữ liệu gửi lên quá lớn");
   }
   return s ? JSON.parse(s) : {};
 }
 
 const readJson = (f, fallback = null) =>
   existsSync(f) ? JSON.parse(readFileSync(f, "utf8")) : fallback;
+const writeJson = (f, v) => writeFileSync(f, JSON.stringify(v, null, 2));
 
 function inside(root, rel) {
   const full = resolve(root, rel);
@@ -72,33 +84,36 @@ const MIME = {
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
   ".png": "image/png",
+  ".webp": "image/webp",
   ".json": "application/json",
   ".md": "text/markdown; charset=utf-8",
   ".mp3": "audio/mpeg",
   ".wav": "audio/wav",
+  ".m4a": "audio/mp4",
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".svg": "image/svg+xml",
   ".ico": "image/x-icon",
+  ".woff2": "font/woff2",
 };
 
 // The desktop UI is served from here too, so the app window talks to one origin
 // (WebView2 blocks pages from its own scheme calling 127.0.0.1).
 const UI_DIR = resolve(process.env.LUAN_UI_DIR || join(REPO, "luan", "desktop", "dist"));
+// The HyperFrames player and runtime for the in-app preview, from this checkout.
+const HF_FILES = {
+  "player.js": join(REPO, "packages", "player", "dist", "hyperframes-player.global.js"),
+  "runtime.js": join(REPO, "packages", "core", "dist", "hyperframe.runtime.iife.js"),
+};
 
-function serveFile(req, res, file) {
+function serveFile(req, res, file, extraHead = {}) {
   if (!file || !existsSync(file) || !statSync(file).isFile())
     return send(res, 404, { error: "Không tìm thấy file" });
   const size = statSync(file).size;
   const type = MIME[extname(file).toLowerCase()] || "application/octet-stream";
   const range = /bytes=(\d*)-(\d*)/.exec(req.headers.range || "");
-  const head = {
-    "Content-Type": type,
-    "Accept-Ranges": "bytes",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Private-Network": "true",
-  };
+  const head = { "Content-Type": type, "Accept-Ranges": "bytes", ...CORS, ...extraHead };
   if (range) {
     const start = range[1] ? Number(range[1]) : 0;
     const end = range[2] ? Math.min(Number(range[2]), size - 1) : size - 1;
@@ -131,12 +146,9 @@ function slugify(name) {
 
 const projectDir = (id) => join(PROJECTS, id);
 
-function projectInfo(id) {
-  const dir = projectDir(id);
-  const meta = readJson(join(dir, "project.json"), { name: id, sources: [] });
-  const pipe = readJson(join(dir, "pipeline.json"), { stages: {} });
+function renderList(dir) {
   const rendersDir = join(dir, "renders");
-  const renders = existsSync(rendersDir)
+  return existsSync(rendersDir)
     ? readdirSync(rendersDir)
         .filter((f) => f.endsWith(".mp4"))
         .map((f) => ({
@@ -147,10 +159,19 @@ function projectInfo(id) {
         }))
         .sort((a, b) => b.mtime - a.mtime)
     : [];
+}
+
+function projectInfo(id) {
+  const dir = projectDir(id);
+  const meta = readJson(join(dir, "project.json"), { name: id, sources: [] });
+  const pipe = readJson(join(dir, "pipeline.json"), { stages: {} });
   const report = readJson(join(dir, "analysis", "footage-report.json"));
+  const story = readJson(join(dir, "story.json"));
+  const timeline = readJson(join(dir, "timeline.json"));
   return {
     id,
     ...meta,
+    claudeSession: undefined,
     brief: readJson(join(dir, "brief.json")),
     stages: Object.fromEntries(
       Object.entries(pipe.stages).map(([k, v]) => [
@@ -175,8 +196,10 @@ function projectInfo(id) {
         }
       : null,
     edl: readJson(join(dir, "edl.json")),
+    story: story ? { beats: story.beats.length, aiPlanned: Boolean(story.aiPlanned) } : null,
+    total: timeline?.total ?? null,
     hasComposition: existsSync(join(dir, "composition", "index.html")),
-    renders,
+    renders: renderList(dir),
     updatedAt: statSync(dir).mtimeMs,
   };
 }
@@ -197,6 +220,8 @@ function listProjects() {
           stages: {},
           report: null,
           edl: null,
+          story: null,
+          total: null,
           hasComposition: false,
           renders: [],
           updatedAt: 0,
@@ -205,6 +230,40 @@ function listProjects() {
       }
     })
     .sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+/** What the editor needs: the placed timeline, the editable story and the sentences. */
+function editorState(id) {
+  const dir = projectDir(id);
+  const edl = readJson(join(dir, "edl.json"));
+  return {
+    timeline: readJson(join(dir, "timeline.json")),
+    story: readStory(dir),
+    brief: readJson(join(dir, "brief.json")),
+    // Word timings stay on the engine; the editor needs the sentences only.
+    rows: (edl?.rows || []).map(({ words: _words, ...r }) => r),
+    images: (readJson(join(dir, "analysis", "footage-report.json"))?.items || [])
+      .filter((a) => a.kind === "image")
+      .map((a) => ({ id: a.id, name: basename(a.path) })),
+    proxies: proxiesState(dir),
+  };
+}
+
+function proxiesState(dir) {
+  const f = join(dir, "composition", "assets", "footage");
+  if (!existsSync(f)) return { ready: 0, total: 0 };
+  const files = readdirSync(f).filter((n) => /\.(mov|mp4|m4v|mkv|webm)$/i.test(n));
+  return { ready: files.filter((n) => proxyReady(dir, join(f, n))).length, total: files.length };
+}
+
+/** Compose and report a blocked compose (hand-edited composition) as an error. */
+function composeNow(dir, opts = {}) {
+  try {
+    return compose(dir, opts);
+  } catch (error) {
+    if (error?.name === "BlockedError") error.status = 409;
+    throw error;
+  }
 }
 
 // ---------- jobs (long tasks, streamed over SSE) ----------
@@ -222,17 +281,27 @@ function startJob(projectId, kind, work) {
     startedAt: Date.now(),
   };
   jobs.set(job.id, job);
-  const emit = (type, text) => {
-    const e = { type, text, at: Date.now() };
+  const emit = (type, text, extra = {}) => {
+    const e = { type, text, at: Date.now(), ...extra };
     job.log.push(e);
     if (job.log.length > 3000) job.log.shift();
     for (const res of job.listeners) res.write(`data: ${JSON.stringify(e)}\n\n`);
   };
-  work((text) => emit("log", text))
+  const log = (text) => emit("log", text);
+  log.event = (e) => {
+    if (e.kind === "thinking") {
+      // One progress line per ~400 thinking tokens, not one per delta.
+      if (e.tokens - (job.lastThinking || 0) < 400) return;
+      job.lastThinking = e.tokens;
+      return emit("thinking", `Claude đang suy nghĩ… (${e.tokens} token)`);
+    }
+    emit(e.kind === "tool" ? "tool" : "ai", e.kind === "tool" ? `${e.name}: ${e.text}` : e.text);
+  };
+  work(log)
     .then((result) => {
       job.status = "done";
       job.result = result;
-      emit("done", "Xong");
+      emit("done", "Xong", { result });
     })
     .catch((error) => {
       job.status = error?.name === "BlockedError" ? "blocked" : "failed";
@@ -245,31 +314,49 @@ function startJob(projectId, kind, work) {
   return job;
 }
 
-const STEPS = ["analyze", "compose", "validate", "render"];
+const STEPS = ["analyze", "plan", "compose", "validate", "render"];
 
-async function runSteps(id, steps, log) {
+async function runSteps(id, steps, log, { force = false } = {}) {
   const dir = projectDir(id);
   const meta = readJson(join(dir, "project.json"));
+  const brief = readJson(join(dir, "brief.json"), {});
   for (const step of steps) {
     log(`▶ ${step}`);
     if (step === "analyze") {
       await analyze({ project: dir, sources: meta.sources, log });
+    } else if (step === "plan") {
+      // The storyboard needs the sentence list, which the first compose writes.
+      if (!existsSync(join(dir, "edl.json"))) composeNow(dir, { force });
+      const r = await planStory(dir, { onEvent: log.event });
+      log(
+        `Storyboard: ${r.beats} hiệu ứng · chương: ${r.chapters.join(", ") || "–"} · ${r.corrections} sửa lỗi phụ đề${r.dropped.length ? ` · bỏ ${r.dropped.length} thẻ có số liệu không có trong lời nói` : ""}`,
+      );
     } else if (step === "compose") {
       const pipe = new Pipeline(dir);
-      const r = await pipe.stage("compose", { at: Date.now() }, async () => compose(dir));
-      log(
-        `Dựng ${r.output.clips} clip, ${r.output.kept}/${r.output.sentences} câu, ${r.output.duration}s, ${r.output.captions} nhóm phụ đề`,
+      const r = await pipe.stage("compose", { at: Date.now() }, async () =>
+        composeNow(dir, { force }),
       );
+      if (r.status === "blocked") throw new Error(pipe.state.stages.compose.error);
+      const o = r.output;
+      log(
+        `Dựng ${o.clips} clip, ${o.kept}/${o.sentences} câu, ${o.beats} hiệu ứng, ${o.captions} nhóm phụ đề, ${o.sfx} SFX${o.music ? ", có nhạc nền" : ""} · ${o.duration}s`,
+      );
+      // Preview proxies in the background of this job (renders use the originals).
+      await ensureProxies(dir, log);
     } else if (step === "validate") {
       const v = await validate(join(dir, "composition"));
       log(`Lint: ${v.lintOk ? "đạt" : "lỗi"} · Check: ${v.checkOk ? "đạt" : "lỗi"}`);
-      for (const f of v.findings.filter((x) => x.severity !== "info"))
+      for (const f of v.findings.filter((x) => x.severity === "error" || x.severity === "warning"))
         log(`  ${f.severity} ${f.rule}: ${f.message}`);
       if (!v.lintOk || !v.checkOk) throw new Error("Kiểm tra composition chưa đạt, xem log");
     } else if (step === "render") {
       const pipe = new Pipeline(dir);
       const r = await pipe.stage("render", { at: Date.now() }, () =>
-        render(dir, { name: `final-${Date.now()}`, onLog: log }),
+        render(dir, {
+          name: `final-${Date.now()}`,
+          quality: brief.quality || "standard",
+          onLog: log,
+        }),
       );
       log(
         `MP4: ${basename(r.output.file)} · ${r.output.duration.toFixed(1)}s · ${r.output.video?.width}×${r.output.video?.height} · ${r.output.sizeMB} MB`,
@@ -279,105 +366,62 @@ async function runSteps(id, steps, log) {
   return projectInfo(id);
 }
 
-// ---------- Claude (local mode: Claude Code on this machine; API mode when a key exists) ----------
+// ---------- Claude chat (local mode: Claude Code on this machine) ----------
 
-function findClaude() {
-  const onPath = findTool("claude");
-  if (onPath) return onPath;
-  const found = [];
-  for (const ext of [".vscode", ".cursor", ".windsurf"]) {
-    const base = join(homedir(), ext, "extensions");
-    if (!existsSync(base)) continue;
-    for (const d of readdirSync(base).filter((n) => n.startsWith("anthropic.claude-code-"))) {
-      const p = join(
-        base,
-        d,
-        "resources",
-        "native-binary",
-        process.platform === "win32" ? "claude.exe" : "claude",
-      );
-      if (existsSync(p)) found.push({ p, m: statSync(p).mtimeMs });
-    }
-  }
-  return found.sort((a, b) => b.m - a.m)[0]?.p ?? null;
+const CLI = join(REPO, "luan", "orchestrator", "cli.mjs").replace(/\\/g, "/");
+const CLAUDE_RULES = `Bạn là AI Creative Director của LUAN AI VIDEO STUDIO, đang làm trong thư mục một dự án video bất động sản (HyperFrames).
+Các file của dự án:
+- brief.json: title, subtitle, cta, hotline, targetDuration, captions, corrections [{from,to}] (sửa chữ phụ đề nghe sai), quality (draft|standard|high), notes.
+- edl.json: rows = từng câu nói (id, source, sourceIn, sourceOut, text, keep, captionText tuỳ chọn để sửa chữ phụ đề của câu đó). Bỏ câu: keep=false.
+- story.json: storyboard hiệu ứng. theme {accent, brand}, keywords [], music {enabled, rel, volume}, sfx {enabled, volume}, beats [].
+  Beat: type hook|card|full|stats|badge|outro; card/full/stats/badge gắn "row" (id câu trong edl) + "offset" (giây từ đầu câu) + duration;
+  trường: chapter, index, kicker, title, accent, note, sub, label, image (id ảnh), stat {value, unit, label}, dates [{label, value}], bullets [], rows [{value, unit, label}] (cho stats).
+  hook: mở đầu (không có row); outro: kết (title, sub, label=hotline).
+- timeline.json (chỉ đọc): thời điểm thật của từng câu (rows), từng beat, phụ đề — dùng để biết "giây thứ X" là câu nào.
+- composition/ là file sinh tự động từ các file trên — KHÔNG sửa trực tiếp trừ khi người dùng yêu cầu chỉnh thứ mà storyboard không làm được.
+Sau khi sửa brief/edl/story, LUÔN chạy: node "${CLI}" compose --project .
+Chỉ chạy validate (node "${CLI}" validate --project .) khi được yêu cầu kiểm tra; chỉ render khi người dùng yêu cầu xuất video.
+Không bịa giá bán, pháp lý, ngày tháng, quy mô: con số trên màn hình phải có trong lời nói hoặc brief. Không xoá file nguồn.
+Trả lời ngắn gọn bằng tiếng Việt, nói rõ đã đổi gì.`;
+
+function chatFile(dir) {
+  return join(dir, "chat.json");
 }
 
-const CLAUDE_RULES = `Bạn là AI Creative Director của LUAN AI VIDEO STUDIO, đang làm trong thư mục một dự án video.
-Cấu trúc: project.json (nguồn tư liệu), brief.json (tiêu đề, phụ đề, CTA, hotline, thời lượng mục tiêu, captions),
-analysis/footage-report.json + analysis/<id>/transcript.json, edl.json (mỗi câu một dòng, "keep" true/false),
-composition/ (project HyperFrames: index.html, compositions/*.html).
-Quy trình sửa: chỉnh brief.json hoặc edl.json (bật/tắt câu, đổi thứ tự rows), rồi chạy
-  node "${join(REPO, "luan", "orchestrator", "cli.mjs").replace(/\\/g, "/")}" compose --project .
-  node "${join(REPO, "luan", "orchestrator", "cli.mjs").replace(/\\/g, "/")}" validate --project .
-Chỉ render khi người dùng yêu cầu xuất video: ... cli.mjs render --project .
-Có thể sửa trực tiếp composition/*.html theo chuẩn HyperFrames (đọc ${join(REPO, "skills", "hyperframes", "SKILL.md").replace(/\\/g, "/")}).
-Không bịa giá bán, pháp lý, ngày tháng, quy mô. Không xoá file nguồn. Trả lời ngắn gọn bằng tiếng Việt.`;
-
-function chatWithClaude(id, message, log) {
-  return new Promise((resolveP, reject) => {
-    const bin = findClaude();
-    if (!bin)
-      return reject(
-        Object.assign(new Error("Không tìm thấy Claude Code trên máy"), { name: "BlockedError" }),
-      );
-    const dir = projectDir(id);
-    const meta = readJson(join(dir, "project.json"));
-    const args = [
-      "-p",
-      `${CLAUDE_RULES}\n\nYêu cầu: ${message}`,
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--permission-mode",
-      "acceptEdits",
-      "--allowedTools",
-      "Read",
-      "Edit",
-      "Write",
-      "Glob",
-      "Grep",
-      "Bash(node:*)",
-      "Bash(npx hyperframes:*)",
-      "Bash(npx --yes hyperframes:*)",
-      "--add-dir",
-      join(REPO, "skills"),
-    ];
-    if (meta.claudeSession) args.push("--resume", meta.claudeSession);
-    const p = spawn(bin, args, { cwd: dir, windowsHide: true });
-    let buf = "";
-    let session = meta.claudeSession || null;
-    let finalText = "";
-    p.stdout.on("data", (c) => {
-      buf += c;
-      let i;
-      while ((i = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, i).trim();
-        buf = buf.slice(i + 1);
-        const m = line ? firstJsonObject(line) : null;
-        if (!m) continue;
-        if (m.session_id) session = m.session_id;
-        if (m.type === "assistant")
-          for (const c2 of m.message?.content || []) {
-            if (c2.type === "text" && c2.text.trim()) log(c2.text);
-            if (c2.type === "tool_use")
-              log(
-                `⚙ ${c2.name}: ${String(c2.input?.description || c2.input?.command || c2.input?.file_path || "").slice(0, 140)}`,
-              );
-          }
-        if (m.type === "result") finalText = m.result || "";
-      }
-    });
-    p.stderr.on("data", (c) => log(String(c).slice(0, 300)));
-    p.on("close", (code) => {
-      if (session)
-        writeFileSync(
-          join(dir, "project.json"),
-          JSON.stringify({ ...meta, claudeSession: session }, null, 2),
-        );
-      if (code === 0) resolveP({ reply: finalText });
-      else reject(new Error(`Claude kết thúc với mã ${code}`));
-    });
+async function chatWithClaude(id, message, log, context = {}) {
+  const dir = projectDir(id);
+  const meta = readJson(join(dir, "project.json"));
+  const history = readJson(chatFile(dir), []);
+  const ctx = [];
+  if (Number.isFinite(context.time))
+    ctx.push(`Người dùng đang đứng ở giây ${context.time.toFixed(1)} trên timeline.`);
+  if (context.beat) ctx.push(`Beat đang chọn: ${context.beat}.`);
+  const prompt = `${meta.claudeSession ? "" : `${CLAUDE_RULES}\n\n`}${ctx.join(" ")}\nYêu cầu: ${message}`;
+  const turn = { role: "user", text: message, at: Date.now() };
+  const reply = { role: "ai", text: "", tools: [], at: 0 };
+  const r = await runClaude(prompt, {
+    cwd: dir,
+    resume: meta.claudeSession || null,
+    tools: ["Read", "Edit", "Write", "Glob", "Grep", "Bash(node:*)"],
+    addDirs: [join(REPO, "skills")],
+    onEvent: (e) => {
+      if (e.kind === "tool") reply.tools.push(`${e.name}: ${e.text}`);
+      if (e.kind === "text") reply.text += (reply.text ? "\n" : "") + e.text;
+      log.event(e);
+    },
+  }).catch((error) => {
+    // A stale session id (Claude Code was reinstalled) is dropped so the next turn starts fresh.
+    if (meta.claudeSession) writeJson(join(dir, "project.json"), { ...meta, claudeSession: null });
+    throw error;
   });
+  reply.text = r.text || reply.text;
+  reply.at = Date.now();
+  writeJson(join(dir, "project.json"), {
+    ...readJson(join(dir, "project.json")),
+    claudeSession: r.session,
+  });
+  writeJson(chatFile(dir), [...history, turn, reply].slice(-200));
+  return { reply: reply.text, cost: r.cost };
 }
 
 // ---------- settings ----------
@@ -405,6 +449,28 @@ const VOICE_KEYS = [
   "LUAN_TTS_MAX_CHARS",
 ];
 
+// ---------- preview (composition served with proxy footage) ----------
+
+async function servePreview(req, res, id, rel) {
+  const dir = projectDir(id);
+  const comp = join(dir, "composition");
+  const file = inside(comp, rel || "index.html");
+  if (!file) return send(res, 404, { error: "Không tìm thấy" });
+  if (
+    /^assets[\\/]footage[\\/]/i.test(rel) &&
+    /\.(mov|mp4|m4v|mkv|webm)$/i.test(rel) &&
+    existsSync(file)
+  ) {
+    // The player gets the light H.264 proxy (made now if missing); renders use the original.
+    try {
+      return serveFile(req, res, await ensureProxy(dir, file), { "Content-Type": "video/mp4" });
+    } catch {
+      return serveFile(req, res, file);
+    }
+  }
+  return serveFile(req, res, file, { "Cache-Control": "no-store" });
+}
+
 // ---------- routes ----------
 
 export const server = http.createServer(async (req, res) => {
@@ -412,9 +478,8 @@ export const server = http.createServer(async (req, res) => {
   const p = decodeURIComponent(url.pathname);
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Private-Network": "true",
-      "Access-Control-Allow-Methods": "GET,POST,PUT",
+      ...CORS,
+      "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE",
       "Access-Control-Allow-Headers": "Content-Type",
     });
     return res.end();
@@ -424,15 +489,19 @@ export const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok: true,
         studioRoot: STUDIO_ROOT,
+        soundLibrary: SOUND_LIBRARY,
         tools: {
           ffmpeg: Boolean(findTool("ffmpeg")),
           whisper: whisperAvailable(),
           claude: Boolean(findClaude()),
           claudeApi: Boolean(process.env.ANTHROPIC_API_KEY),
+          sounds: existsSync(SOUND_LIBRARY),
         },
         voice: voice.status(),
       });
     }
+    if (req.method === "GET" && p.startsWith("/hf/") && HF_FILES[p.slice(4)])
+      return serveFile(req, res, HF_FILES[p.slice(4)]);
     if (req.method === "GET" && p === "/api/projects") return send(res, 200, listProjects());
     if (req.method === "POST" && p === "/api/projects") {
       const { name, sources } = await readBody(req);
@@ -443,14 +512,11 @@ export const server = http.createServer(async (req, res) => {
       let id = slugify(name);
       for (let n = 2; existsSync(projectDir(id)); n++) id = `${slugify(name)}-${n}`;
       mkdirSync(projectDir(id), { recursive: true });
-      writeFileSync(
-        join(projectDir(id), "project.json"),
-        JSON.stringify(
-          { name: name.trim(), sources: srcs, createdAt: new Date().toISOString() },
-          null,
-          2,
-        ),
-      );
+      writeJson(join(projectDir(id), "project.json"), {
+        name: name.trim(),
+        sources: srcs,
+        createdAt: new Date().toISOString(),
+      });
       return send(res, 200, projectInfo(id));
     }
     let m = /^\/api\/projects\/([^/]+)(\/[a-z-]+)?$/.exec(p);
@@ -460,36 +526,106 @@ export const server = http.createServer(async (req, res) => {
         return send(res, 404, { error: "Không có dự án này" });
       const dir = projectDir(id);
       if (req.method === "GET" && action === "") return send(res, 200, projectInfo(id));
+      if (req.method === "DELETE" && action === "") {
+        // Never deleted outright: moved to _trash, restorable by moving the folder back.
+        mkdirSync(TRASH, { recursive: true });
+        renameSync(dir, join(TRASH, `${id}-${Date.now()}`));
+        return send(res, 200, { ok: true });
+      }
+      if (req.method === "PUT" && action === "/meta") {
+        const { name } = await readBody(req);
+        if (!name?.trim()) return send(res, 400, { error: "Cần tên dự án" });
+        writeJson(join(dir, "project.json"), {
+          ...readJson(join(dir, "project.json")),
+          name: name.trim().slice(0, 120),
+        });
+        return send(res, 200, projectInfo(id));
+      }
       if (req.method === "PUT" && action === "/brief") {
         const brief = await readBody(req);
-        writeFileSync(join(dir, "brief.json"), JSON.stringify(brief, null, 2));
+        writeJson(join(dir, "brief.json"), brief);
         return send(res, 200, projectInfo(id));
       }
       if (req.method === "PUT" && action === "/sources") {
         const { sources } = await readBody(req);
         const meta = readJson(join(dir, "project.json"));
         meta.sources = (sources || []).map((s) => resolve(String(s))).filter((s) => existsSync(s));
-        writeFileSync(join(dir, "project.json"), JSON.stringify(meta, null, 2));
+        writeJson(join(dir, "project.json"), meta);
         return send(res, 200, projectInfo(id));
       }
       if (req.method === "PUT" && action === "/edl") {
-        const { keep } = await readBody(req);
+        const { keep, captionText } = await readBody(req);
         const edl = readJson(join(dir, "edl.json"));
         if (!edl) return send(res, 400, { error: "Chưa có EDL: chạy Phân tích + Dựng trước" });
-        for (const r of edl.rows) if (r.id in (keep || {})) r.keep = Boolean(keep[r.id]);
-        writeFileSync(join(dir, "edl.json"), JSON.stringify(edl, null, 2));
+        for (const r of edl.rows) {
+          if (keep && r.id in keep) r.keep = Boolean(keep[r.id]);
+          if (captionText && r.id in captionText) {
+            const t = String(captionText[r.id] ?? "")
+              .replace(/\s+/g, " ")
+              .trim();
+            if (t && t !== r.text) r.captionText = t.slice(0, 400);
+            else delete r.captionText;
+          }
+        }
+        writeJson(join(dir, "edl.json"), edl);
         return send(res, 200, projectInfo(id));
       }
+      if (req.method === "GET" && action === "/editor") {
+        if (
+          !existsSync(join(dir, "timeline.json")) &&
+          existsSync(join(dir, "analysis", "footage-report.json"))
+        )
+          composeNow(dir);
+        return send(res, 200, editorState(id));
+      }
+      if (req.method === "PUT" && action === "/story") {
+        const { story, force } = await readBody(req);
+        const edl = readJson(join(dir, "edl.json"));
+        const clean = sanitizeStory(story, { rowIds: new Set((edl?.rows || []).map((r) => r.id)) });
+        const prev = readJson(join(dir, "story.json"));
+        writeJson(join(dir, "story.json"), { ...clean, aiPlanned: prev?.aiPlanned || false });
+        try {
+          composeNow(dir, { force: Boolean(force) });
+        } catch (error) {
+          if (error.status === 409) return send(res, 409, { error: error.message, blocked: true });
+          throw error;
+        }
+        return send(res, 200, editorState(id));
+      }
+      if (req.method === "POST" && action === "/recompose") {
+        const { force } = await readBody(req);
+        try {
+          composeNow(dir, { force: Boolean(force) });
+        } catch (error) {
+          if (error.status === 409) return send(res, 409, { error: error.message, blocked: true });
+          throw error;
+        }
+        return send(res, 200, editorState(id));
+      }
       if (req.method === "POST" && action === "/run") {
-        const { steps } = await readBody(req);
+        const { steps, force } = await readBody(req);
         const list = (steps || STEPS).filter((s) => STEPS.includes(s));
-        const job = startJob(id, list.join("+"), (log) => runSteps(id, list, log));
+        const job = startJob(id, list.join("+"), (log) =>
+          runSteps(id, list, log, { force: Boolean(force) }),
+        );
         return send(res, 200, { job: job.id });
       }
+      if (req.method === "GET" && action === "/chat")
+        return send(res, 200, readJson(chatFile(dir), []));
       if (req.method === "POST" && action === "/chat") {
-        const { message } = await readBody(req);
+        const { message, context, reset } = await readBody(req);
+        if (reset) {
+          writeJson(join(dir, "project.json"), {
+            ...readJson(join(dir, "project.json")),
+            claudeSession: null,
+          });
+          writeJson(chatFile(dir), []);
+          return send(res, 200, { ok: true });
+        }
         if (!message?.trim()) return send(res, 400, { error: "Tin nhắn trống" });
-        const job = startJob(id, "chat", (log) => chatWithClaude(id, message.trim(), log));
+        const job = startJob(id, "chat", (log) =>
+          chatWithClaude(id, message.trim(), log, context || {}),
+        );
         return send(res, 200, { job: job.id });
       }
       if (req.method === "POST" && action === "/voice") {
@@ -525,6 +661,9 @@ export const server = http.createServer(async (req, res) => {
         return send(res, 200, { ok: true });
       }
     }
+    m = /^\/preview\/([^/]+)\/?(.*)$/.exec(p);
+    if (req.method === "GET" && m && SLUG.test(m[1]) && existsSync(projectDir(m[1])))
+      return servePreview(req, res, m[1], m[2]);
     m = /^\/api\/jobs\/([^/]+)(\/events)?$/.exec(p);
     if (m && req.method === "GET") {
       const job = jobs.get(m[1]);
@@ -541,8 +680,7 @@ export const server = http.createServer(async (req, res) => {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         Connection: "keep-alive",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Private-Network": "true",
+        ...CORS,
       });
       for (const e of job.log) res.write(`data: ${JSON.stringify(e)}\n\n`);
       if (job.status === "running") job.listeners.add(res);
@@ -565,6 +703,13 @@ export const server = http.createServer(async (req, res) => {
           .reverse(),
       );
     }
+    if (req.method === "GET" && p === "/api/library/sounds") {
+      const role = url.searchParams.get("role");
+      const all = listSounds();
+      return send(res, 200, role ? all.filter((s) => s.role === role) : all);
+    }
+    if (req.method === "GET" && p.startsWith("/library/sound/"))
+      return serveFile(req, res, soundPath(p.slice("/library/sound/".length)));
     if (p === "/api/settings/voice") {
       if (req.method === "PUT") {
         const body = await readBody(req);
@@ -588,7 +733,7 @@ export const server = http.createServer(async (req, res) => {
     }
     send(res, 404, { error: "Không tìm thấy" });
   } catch (error) {
-    send(res, error?.name === "BlockedError" ? 409 : 500, {
+    send(res, error?.status || (error?.name === "BlockedError" ? 409 : 500), {
       error: String(error?.message || error),
     });
   }

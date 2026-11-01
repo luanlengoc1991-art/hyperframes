@@ -61,16 +61,29 @@ export async function probeOutput(file) {
   };
 }
 
+// Output quality presets: draft for a quick look, standard for social (about 10 Mb/s), high for delivery.
+export const QUALITY = {
+  draft: ["--quality", "draft"],
+  standard: ["--video-bitrate", "10M"],
+  high: ["--quality", "delivery"],
+};
+
 /** Render <compDir> to <projectDir>/renders/<name>.mp4 (SDR) and verify it. */
-export async function render(projectDir, { name = "final", onLog = () => {} } = {}) {
+export async function render(
+  projectDir,
+  { name = "final", quality = "standard", onLog = () => {} } = {},
+) {
   const compDir = join(projectDir, "composition");
   const rendersDir = join(projectDir, "renders");
   mkdirSync(rendersDir, { recursive: true });
   const out = join(rendersDir, `${name}.mp4`);
-  const r = await hyperframes(["render", "--output", out, "--sdr"], {
-    cwd: compDir,
-    timeoutMs: 3_600_000,
-  });
+  const r = await hyperframes(
+    ["render", "--output", out, "--sdr", ...(QUALITY[quality] || QUALITY.standard)],
+    {
+      cwd: compDir,
+      timeoutMs: 3_600_000,
+    },
+  );
   for (const line of clean(r.stdout + r.stderr).split(/\r?\n/))
     if (line.trim() && !/^\[(INFO|DEBUG)\]/.test(line)) onLog(line.trim());
   if (r.code !== 0 || !existsSync(out))
@@ -78,7 +91,7 @@ export async function render(projectDir, { name = "final", onLog = () => {} } = 
   const info = await probeOutput(out);
   writeFileSync(
     join(rendersDir, `${name}.json`),
-    JSON.stringify({ file: out, renderedAt: new Date().toISOString(), ...info }, null, 2),
+    JSON.stringify({ file: out, quality, renderedAt: new Date().toISOString(), ...info }, null, 2),
   );
   return { file: out, ...info };
 }

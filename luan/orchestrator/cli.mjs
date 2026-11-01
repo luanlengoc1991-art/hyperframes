@@ -19,6 +19,7 @@ import { writeReport } from "./stages/report.mjs";
 import { transcribeItem } from "./stages/transcribe.mjs";
 import * as voice from "../voice/index.mjs";
 import { compose } from "./stages/compose.mjs";
+import { planStory } from "./stages/plan.mjs";
 import { render, validate } from "./stages/render.mjs";
 
 function args(argv) {
@@ -100,9 +101,23 @@ if (isMain) {
       if (!a.project) throw new Error("Cần --project");
       const pipe = new Pipeline(resolve(a.project));
       const r = await pipe.stage("compose", { at: Date.now() }, async () =>
-        compose(resolve(a.project), { rebuildEdl: Boolean(a["rebuild-edl"]) }),
+        compose(resolve(a.project), {
+          rebuildEdl: Boolean(a["rebuild-edl"]),
+          replanStory: Boolean(a["replan"]),
+          force: Boolean(a.force),
+        }),
       );
+      if (r.status === "blocked") throw new Error(pipe.state.stages.compose.error);
       console.log(JSON.stringify(r.output, null, 2));
+    } else if (cmd === "plan") {
+      if (!a.project) throw new Error("Cần --project");
+      const r = await planStory(resolve(a.project), {
+        onEvent: (e) =>
+          console.log(
+            `[${new Date().toLocaleTimeString()}] ${e.kind === "tool" ? `⚙ ${e.name} ${e.text}` : e.kind === "thinking" ? `… suy nghĩ ${e.tokens} token` : e.text}`,
+          ),
+      });
+      console.log(JSON.stringify(r, null, 2));
     } else if (cmd === "validate") {
       if (!a.project) throw new Error("Cần --project");
       console.log(JSON.stringify(await validate(join(resolve(a.project), "composition")), null, 2));

@@ -1,7 +1,7 @@
 // Engine API in-process, on scratch folders: a temporary studio root and secrets file,
 // so nothing touches the real projects or luan/.env.local. No Claude, no paid API.
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -87,4 +87,44 @@ test("voice settings write only allowed keys to the configured file, newlines st
 test("unknown project and bad ids are 404", async () => {
   assert.equal((await api("/api/projects/khong-ton-tai")).status, 404);
   assert.equal((await api("/api/projects/..%2F..")).status, 404);
+});
+
+test("preview and sound library are confined to their folders", async () => {
+  assert.equal((await fetch(`${base}/preview/du-an-can-gio/..%2F..%2Fproject.json`)).status, 404);
+  assert.equal((await fetch(`${base}/library/sound/..%2F..%2F..%2Fwindows%2Fwin.ini`)).status, 404);
+});
+
+test("storyboard save is cleaned before it is written; chat history starts empty", async () => {
+  const dir = join(process.env.LUAN_STUDIO_ROOT, "_projects", "du-an-can-gio");
+  writeFileSync(
+    join(dir, "edl.json"),
+    JSON.stringify({ rows: [{ id: "a#1", keep: true, text: "x" }] }),
+  );
+  // No analysis yet, so the compose after the save fails, but the cleaned story is on disk.
+  await put("/api/projects/du-an-can-gio/story", {
+    story: {
+      theme: { accent: "red; background:url(x)" },
+      beats: [
+        { id: "ok", type: "card", row: "a#1", title: "Tiện ích" },
+        { id: "x", type: "script", row: "a#1" },
+        { id: "gone", type: "card", row: "khong-co" },
+      ],
+    },
+  });
+  const saved = JSON.parse(readFileSync(join(dir, "story.json"), "utf8"));
+  assert.deepEqual(
+    saved.beats.map((b) => b.id),
+    ["ok"],
+  );
+  assert.equal(saved.theme.accent, "#D2FF3C");
+  const chat = await api("/api/projects/du-an-can-gio/chat");
+  assert.deepEqual(chat.body, []);
+});
+
+test("delete moves the project to _trash instead of erasing it", async () => {
+  const r = await api("/api/projects/du-an-can-gio-2", { method: "DELETE" });
+  assert.equal(r.status, 200);
+  assert.equal((await api("/api/projects/du-an-can-gio-2")).status, 404);
+  const trash = readdirSync(join(process.env.LUAN_STUDIO_ROOT, "_trash"));
+  assert.ok(trash.some((n) => n.startsWith("du-an-can-gio-2-")));
 });

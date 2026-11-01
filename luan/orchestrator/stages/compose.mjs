@@ -1,17 +1,40 @@
 // Stages 4–10 for talking-head footage: sentence-level Edit Decision List, non-destructive
-// smart cut and a HyperFrames composition (footage clips trimmed with data-media-start,
-// word-level captions, title and end card). Every cut stays editable: toggle `keep` in
-// edl.json and compose again, or edit the composition in HyperFrames Studio.
+// smart cut and a HyperFrames composition: footage clips trimmed with data-media-start, the
+// motion layer from story.json (hook, cards, full screens, stats, badges, end card, chapter
+// bar), keyword captions, music and sound effects. Every cut stays editable: toggle `keep` in
+// edl.json, move beats in story.json, then compose again.
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import {
   copyFileSync,
   existsSync,
   linkSync,
   mkdirSync,
   readFileSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { extname, join } from "node:path";
+import { dirname, extname, join } from "node:path";
+import { BlockedError } from "../lib/pipeline.mjs";
+import { findTool } from "../lib/proc.mjs";
+import { libraryAvailable, listSounds, pickSound, soundPath } from "../lib/sounds.mjs";
+import {
+  captionsHtml,
+  chaptersOf,
+  correctText,
+  introLength,
+  motionHtml,
+  musicAutomation,
+  outroLength,
+  planBeats,
+  resolveBeats,
+  retimeWords,
+  rowTimes,
+  sanitizeStory,
+  soundCues,
+} from "./motion.mjs";
 
+const sha = (s) => createHash("sha1").update(s).digest("hex");
 const round = (n) => Math.round(n * 1000) / 1000;
 const esc = (s) =>
   String(s ?? "").replace(
@@ -29,6 +52,8 @@ export const DEFAULT_BRIEF = {
   hotline: "",
   targetDuration: null,
   captions: true,
+  corrections: [],
+  quality: "standard",
 };
 
 const MAX_WORDS = 24;
@@ -122,22 +147,28 @@ export function clipsOf(edl) {
   return { clips, duration: round(t) };
 }
 
-/** Caption groups of up to 4 words in timeline time. */
-export function captionGroups(clips) {
+/**
+ * Caption groups of up to 6 words in timeline time. A row whose text was edited
+ * (`captionText`) or matches a brief correction gets its words re-timed over the spoken span.
+ */
+export function captionGroups(clips, { corrections = [], offset = 0 } = {}) {
   const groups = [];
   for (const c of clips) {
     const words = c.rows
-      .flatMap((r) => r.words)
+      .flatMap((r) => {
+        const fixed = r.captionText || correctText(r.text, corrections);
+        return fixed ? retimeWords(fixed, r.words) : r.words;
+      })
       .filter((w) => w.start >= c.sourceIn - 0.01 && w.end <= c.sourceOut + 0.01)
       .map((w) => ({
         text: w.text,
-        start: round(c.start + (w.start - c.sourceIn)),
-        end: round(c.start + (w.end - c.sourceIn)),
+        start: round(offset + c.start + (w.start - c.sourceIn)),
+        end: round(offset + c.start + (w.end - c.sourceIn)),
       }));
     let g = [];
     for (const w of words) {
       g.push(w);
-      if (g.length >= 4 || /[.,?!…]$/.test(w.text)) {
+      if (g.length >= 6 || /[.,?!…]$/.test(w.text)) {
         groups.push(g);
         g = [];
       }
@@ -155,6 +186,7 @@ export function captionGroups(clips) {
 
 function linkOrCopy(src, dest) {
   if (existsSync(dest)) return "existing";
+  mkdirSync(dirname(dest), { recursive: true });
   try {
     linkSync(src, dest);
     return "hardlink";
@@ -164,7 +196,118 @@ function linkOrCopy(src, dest) {
   }
 }
 
-function indexHtml({ width, height, duration, clips, footage }) {
+const durations = new Map();
+function mediaDuration(file) {
+  if (durations.has(file)) return durations.get(file);
+  let d = null;
+  const ffprobe = findTool("ffprobe");
+  if (ffprobe) {
+    try {
+      const out = execFileSync(
+        ffprobe,
+        ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file],
+        { encoding: "utf8", windowsHide: true },
+      );
+      d = Number.parseFloat(out) || null;
+    } catch {
+      d = null;
+    }
+  }
+  durations.set(file, d);
+  return d;
+}
+
+/** No bed chosen: the first track (in a stable order) long enough for the whole film. */
+function chooseMusic(total) {
+  const first = pickSound("music", "default");
+  if (!first) return null;
+  const pool = listSounds().filter((s) => s.role === "music");
+  const i0 = pool.findIndex((s) => s.rel === first.rel);
+  for (let k = 0; k < Math.min(pool.length, 24); k++) {
+    const s = pool[(i0 + k) % pool.length];
+    const d = mediaDuration(soundPath(s.rel));
+    if (d && d >= total + 1) return s.rel;
+  }
+  return first.rel;
+}
+
+/** The part of a volume envelope that falls inside one clip, in that clip's own time. */
+export function sliceAutomation(auto, start, dur) {
+  const pts = auto.lanes[0].points;
+  const at = (t) => {
+    if (t <= pts[0].t) return pts[0].v;
+    for (let i = 1; i < pts.length; i++)
+      if (t <= pts[i].t) {
+        const a = pts[i - 1];
+        const b = pts[i];
+        return round(a.v + ((b.v - a.v) * (t - a.t)) / (b.t - a.t || 1));
+      }
+    return pts[pts.length - 1].v;
+  };
+  const inner = pts
+    .filter((p) => p.t > start && p.t < start + dur)
+    .map((p) => ({ t: round(p.t - start), v: p.v }));
+  return {
+    version: 1,
+    lanes: [
+      {
+        target: "volume",
+        points: [{ t: 0, v: at(start) }, ...inner, { t: round(dur), v: at(start + dur) }],
+      },
+    ],
+  };
+}
+
+/** A still from the footage, used behind the hook when the project has no images. */
+function posterFrame(src, at, out) {
+  if (existsSync(out)) return true;
+  const ffmpeg = findTool("ffmpeg");
+  if (!ffmpeg) return false;
+  mkdirSync(dirname(out), { recursive: true });
+  try {
+    execFileSync(
+      ffmpeg,
+      [
+        "-v",
+        "error",
+        "-y",
+        "-ss",
+        String(at),
+        "-i",
+        src,
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=1080:-2",
+        "-q:v",
+        "3",
+        out,
+      ],
+      { windowsHide: true },
+    );
+    return existsSync(out);
+  } catch {
+    return false;
+  }
+}
+
+const assetName = (rel) =>
+  `${slug(
+    rel
+      .split("/")
+      .pop()
+      .replace(/\.\w+$/, ""),
+  ).slice(0, 40)}-${sha(rel).slice(0, 6)}`;
+const slug = (s) =>
+  String(s)
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-zA-Z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .toLowerCase()
+    .slice(0, 60);
+
+function indexHtml({ width, height, duration, clips, footage, audio }) {
   const videos = clips
     .map(
       (c, i) => `      <video
@@ -180,6 +323,12 @@ function indexHtml({ width, height, duration, clips, footage }) {
       ></video>`,
     )
     .join("\n");
+  const audios = audio
+    .map(
+      (a) =>
+        `      <audio id="${a.id}" class="clip" src="${esc(a.src)}" data-start="${a.start}" data-duration="${a.duration}" data-track-index="${a.track}"${a.automation ? ` data-automation="${esc(JSON.stringify(a.automation))}"` : ` data-volume="${a.volume}"`} data-fade-in="${a.fadeIn ?? 0.02}" data-fade-out="${a.fadeOut ?? 0.3}"></audio>`,
+    )
+    .join("\n");
   return `<!doctype html>
 <html lang="vi">
   <head>
@@ -188,19 +337,21 @@ function indexHtml({ width, height, duration, clips, footage }) {
     <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
     <style>
       * { margin: 0; padding: 0; box-sizing: border-box; }
-      html, body { width: ${width}px; height: ${height}px; overflow: hidden; background: #000; }
-      #root { position: relative; width: 100%; height: 100%; background: #000; }
+      html, body { width: ${width}px; height: ${height}px; overflow: hidden; background: #0c0e11; }
+      #root { position: relative; width: 100%; height: 100%; background: #0c0e11; }
       .footage { position: absolute; left: 0; top: 0; width: ${width}px; height: ${height}px; object-fit: cover; }
     </style>
   </head>
   <body>
     <div id="root" data-composition-id="main" data-start="0" data-duration="${duration}" data-width="${width}" data-height="${height}">
 ${videos}
-      <div id="captions" data-composition-id="captions" data-composition-src="compositions/captions.html" data-start="0" data-duration="${duration}" data-track-index="2" data-track-kind="captions" data-width="${width}" data-height="${height}"></div>
-      <div id="overlay" data-composition-id="overlay" data-composition-src="compositions/overlay.html" data-start="0" data-duration="${duration}" data-track-index="3" data-track-kind="graphics" data-width="${width}" data-height="${height}"></div>
+      <div id="motion" data-composition-id="motion" data-composition-src="compositions/motion.html" data-start="0" data-duration="${duration}" data-track-index="2" data-track-kind="graphics" data-width="${width}" data-height="${height}"></div>
+      <div id="captions" data-composition-id="captions" data-composition-src="compositions/captions.html" data-start="0" data-duration="${duration}" data-track-index="3" data-track-kind="captions" data-width="${width}" data-height="${height}"></div>
+${audios}
     </div>
     <script>
       const tl = gsap.timeline({ paused: true });
+      window.__timelines = window.__timelines || {};
       window.__timelines["main"] = tl;
     </script>
   </body>
@@ -208,105 +359,54 @@ ${videos}
 `;
 }
 
-function captionsHtml({ width, height, groups, enabled }) {
-  const items = enabled
-    ? groups
-        .map(
-          (g, i) =>
-            `      <div id="cap-${i + 1}" class="clip cap" data-start="${g.start}" data-duration="${round(g.end - g.start)}"><span class="box">${g.words
-              .map((w, j) => `<span id="cap-${i + 1}-${j + 1}" class="w">${esc(w.text)}</span>`)
-              .join(" ")}</span></div>`,
-        )
-        .join("\n")
-    : "";
-  // [selector, start, end] per word: the active word turns gold while it is spoken.
-  const timings = enabled
-    ? groups.flatMap((g, i) => g.words.map((w, j) => [`#cap-${i + 1}-${j + 1}`, w.start, w.end]))
-    : [];
-  const sets = `    const WORDS = ${JSON.stringify(timings)};
-    for (const [sel, start, end] of WORDS) {
-      tl.set(sel, { color: "#FFD45C" }, start);
-      tl.set(sel, { color: "#FFFFFF" }, end);
-    }`;
-  return `<template>
-  <style>
-    #root { position: absolute; inset: 0; pointer-events: none; }
-    .cap {
-      position: absolute; left: ${Math.round(width * 0.08)}px; right: ${Math.round(width * 0.08)}px; top: ${Math.round(height * 0.68)}px;
-      text-align: center; font-family: "Montserrat", sans-serif; font-weight: 800; font-size: ${Math.round(width * 0.062)}px;
-      line-height: 1.35; color: #fff;
-    }
-    /* A dark plate keeps the words readable on bright sky or water (WCAG AA on any footage). */
-    .cap .box {
-      display: inline; padding: 6px 18px; border-radius: 14px; background: rgba(0, 0, 0, 0.62);
-      box-decoration-break: clone; -webkit-box-decoration-break: clone;
-    }
-  </style>
-  <div id="root" data-composition-id="captions" data-width="${width}" data-height="${height}">
-${items}
-  </div>
-  <script>
-    const tl = gsap.timeline({ paused: true });
-${sets}
-    window.__timelines["captions"] = tl;
-  </script>
-</template>
-`;
+// Files compose writes are recorded by hash; one changed since (in Studio or by hand) is not
+// overwritten unless the caller forces it, so manual work is never lost silently.
+const GENERATED = ".luan-generated.json";
+
+function guardedWriter(comp, force) {
+  const recordFile = join(comp, GENERATED);
+  const record = existsSync(recordFile) ? JSON.parse(readFileSync(recordFile, "utf8")) : {};
+  const pending = [];
+  return {
+    add(rel, content) {
+      pending.push([rel, content]);
+    },
+    commit() {
+      const edited = pending
+        .map(([rel]) => rel)
+        .filter((rel) => {
+          const f = join(comp, rel);
+          return existsSync(f) && record[rel] && sha(readFileSync(f, "utf8")) !== record[rel];
+        });
+      if (edited.length && !force)
+        throw new BlockedError(
+          `Composition đã được sửa tay (${edited.join(", ")}). Dựng lại sẽ ghi đè các sửa đổi đó — chọn "Ghi đè" nếu muốn.`,
+        );
+      for (const [rel, content] of pending) {
+        mkdirSync(dirname(join(comp, rel)), { recursive: true });
+        writeFileSync(join(comp, rel), content);
+        record[rel] = sha(content);
+      }
+      writeFileSync(recordFile, JSON.stringify(record, null, 2));
+      return edited;
+    },
+  };
 }
 
-function overlayHtml({ width, height, duration, brief }) {
-  const hasTitle = Boolean(brief.title);
-  const endStart = round(Math.max(0, duration - 3.2));
-  return `<template>
-  <style>
-    #root { position: absolute; inset: 0; pointer-events: none; font-family: "Montserrat", sans-serif; }
-    #ov-title { position: absolute; left: ${Math.round(width * 0.07)}px; right: ${Math.round(width * 0.07)}px; top: ${Math.round(height * 0.08)}px; }
-    #ov-kicker { display: inline-block; padding: 10px 22px; background: #FFD45C; color: #111; font-weight: 800; letter-spacing: .14em; font-size: ${Math.round(width * 0.03)}px; text-transform: uppercase; }
-    #ov-name { margin-top: 18px; color: #fff; font-weight: 800; font-size: ${Math.round(width * 0.078)}px; line-height: 1.15; text-shadow: 0 6px 22px rgba(0,0,0,.6); }
-    #ov-sub { margin-top: 10px; color: #f1f1f1; font-weight: 600; font-size: ${Math.round(width * 0.036)}px; text-shadow: 0 4px 14px rgba(0,0,0,.6); }
-    #ov-end { position: absolute; inset: 0; background: linear-gradient(180deg, rgba(0,0,0,0) 35%, rgba(0,0,0,.82) 100%); }
-    #ov-cta { position: absolute; left: 0; right: 0; bottom: ${Math.round(height * 0.12)}px; text-align: center; }
-    #ov-cta-btn { display: inline-block; padding: 26px 56px; border-radius: 999px; background: #FFD45C; color: #111; font-weight: 800; font-size: ${Math.round(width * 0.05)}px; }
-    #ov-hotline { margin-top: 22px; color: #fff; font-weight: 700; font-size: ${Math.round(width * 0.045)}px; letter-spacing: .04em; }
-  </style>
-  <div id="root" data-composition-id="overlay" data-width="${width}" data-height="${height}">
-${
-  hasTitle
-    ? `    <div id="ov-title" class="clip" data-start="0.3" data-duration="3.2">
-      <div id="ov-kicker">Dự án</div>
-      <h1 id="ov-name">${esc(brief.title)}</h1>
-      ${brief.subtitle ? `<p id="ov-sub">${esc(brief.subtitle)}</p>` : ""}
-    </div>`
-    : ""
-}
-    <div id="ov-end" class="clip" data-start="${endStart}" data-duration="${round(duration - endStart)}">
-      <div id="ov-cta">
-        <div id="ov-cta-btn">${esc(brief.cta || DEFAULT_BRIEF.cta)}</div>
-        ${brief.hotline ? `<div id="ov-hotline">${esc(brief.hotline)}</div>` : ""}
-      </div>
-    </div>
-  </div>
-  <script>
-    const tl = gsap.timeline({ paused: true });
-${
-  hasTitle
-    ? `    tl.fromTo("#ov-kicker", { opacity: 0, x: -40 }, { opacity: 1, x: 0, duration: 0.45, ease: "power3.out" }, 0.3);
-    tl.fromTo("#ov-name", { opacity: 0, filter: "blur(10px)" }, { opacity: 1, filter: "blur(0px)", duration: 0.5, ease: "power3.out" }, 0.45);
-    tl.to(["#ov-kicker", "#ov-name"${brief.subtitle ? ', "#ov-sub"' : ""}], { opacity: 0, duration: 0.35, ease: "power2.in" }, 3.1);`
-    : ""
-}
-    tl.fromTo("#ov-cta", { opacity: 0, y: 60 }, { opacity: 1, y: 0, duration: 0.6, ease: "power3.out" }, ${round(endStart + 0.2)});
-    window.__timelines["overlay"] = tl;
-  </script>
-</template>
-`;
+export function readStory(projectDir) {
+  const f = join(projectDir, "story.json");
+  return existsSync(f) ? sanitizeStory(JSON.parse(readFileSync(f, "utf8"))) : null;
 }
 
 /**
- * Compose <project>/composition from analysis/footage-report.json, transcripts and brief.json.
- * Keeps an existing edl.json (the editable cut) unless `rebuildEdl` is set.
+ * Compose <project>/composition from analysis/footage-report.json, transcripts, brief.json and
+ * story.json (a rule-based first storyboard is written when there is none). Keeps an existing
+ * edl.json (the editable cut) unless `rebuildEdl` is set.
  */
-export function compose(projectDir, { rebuildEdl = false } = {}) {
+export function compose(
+  projectDir,
+  { rebuildEdl = false, replanStory = false, force = false } = {},
+) {
   const report = JSON.parse(
     readFileSync(join(projectDir, "analysis", "footage-report.json"), "utf8"),
   );
@@ -334,34 +434,162 @@ export function compose(projectDir, { rebuildEdl = false } = {}) {
     !rebuildEdl && existsSync(edlPath)
       ? JSON.parse(readFileSync(edlPath, "utf8")).rows
       : buildEdl(aroll, transcripts, brief);
-  const { clips, duration } = clipsOf(edl);
+  const { clips, duration: footage } = clipsOf(edl);
   if (!clips.length) throw new Error("EDL không còn câu nào được giữ");
+
+  // Storyboard: the saved one, or a rule-based first draft placed on the sentences.
+  let story = replanStory ? null : readStory(projectDir);
+  if (!story) {
+    const starts = rowTimes(clips, 0);
+    const kept = edl.filter((r) => r.keep);
+    story = planBeats({
+      rows: kept,
+      rowStart: Object.fromEntries(Object.entries(starts).map(([k, v]) => [k, v.start])),
+      brief,
+    });
+    writeFileSync(join(projectDir, "story.json"), JSON.stringify(story, null, 2));
+  }
+  const intro = introLength(story);
+  const outro = outroLength(story);
+  const total = round(intro + footage + outro);
 
   const comp = join(projectDir, "composition");
   mkdirSync(join(comp, "assets", "footage"), { recursive: true });
-  mkdirSync(join(comp, "compositions"), { recursive: true });
-  const footage = {};
+  const footageRel = {};
   const linked = {};
   for (const id of new Set(clips.map((c) => c.source))) {
     const item = report.items.find((a) => a.id === id);
     const rel = `assets/footage/${id}${extname(item.path).toLowerCase()}`;
     linked[id] = linkOrCopy(item.path, join(comp, rel));
-    footage[id] = rel;
+    footageRel[id] = rel;
   }
-  const first = report.items.find((a) => a.id === clips[0].source);
-  const width = first.video?.width || 1080;
-  const height = first.video?.height || 1920;
-  const groups = captionGroups(clips);
+  // Project images (renders, maps, logos) are available to beats by their media id.
+  const images = {};
+  for (const img of report.items.filter((a) => a.kind === "image")) {
+    const rel = `assets/images/${img.id}${extname(img.path).toLowerCase()}`;
+    linkOrCopy(img.path, join(comp, rel));
+    images[img.id] = rel;
+  }
+  const firstItem = report.items.find((a) => a.id === clips[0].source);
+  // Stills from different moments of the footage, one per hook / full screen without an image.
+  const needPosters = Math.min(
+    8,
+    story.beats.filter(
+      (b) => (b.type === "hook" || b.type === "full") && !(b.image && images[b.image]),
+    ).length,
+  );
+  const posters = [];
+  for (let i = 0; i < needPosters; i++) {
+    const f = (i + 0.5) / needPosters;
+    let t = f * footage;
+    const c = clips.find((x) => t < x.start + x.duration) || clips[clips.length - 1];
+    t = Math.min(c.duration - 0.1, Math.max(0, t - c.start));
+    const item = report.items.find((a) => a.id === c.source);
+    const at = round(c.sourceIn + t);
+    const rel = `assets/images/poster-${c.source.slice(-6)}-${Math.round(at * 10)}.jpg`;
+    if (posterFrame(item.path, at, join(comp, rel))) posters.push(rel);
+  }
 
-  writeFileSync(join(comp, "index.html"), indexHtml({ width, height, duration, clips, footage }));
-  writeFileSync(
-    join(comp, "compositions", "captions.html"),
-    captionsHtml({ width, height, groups, enabled: brief.captions }),
+  const width = firstItem.video?.width || 1080;
+  const height = firstItem.video?.height || 1920;
+  const timelineClips = clips.map((c) => ({ ...c, start: round(c.start + intro) }));
+  const groups = captionGroups(clips, { corrections: brief.corrections || [], offset: intro });
+  const beats = resolveBeats(story, rowTimes(clips, intro), { intro, footage });
+  let posterIndex = 0;
+  for (const b of beats)
+    if ((b.type === "hook" || b.type === "full") && !(b.image && images[b.image]) && posters.length)
+      b.poster = posters[posterIndex++ % posters.length];
+  const chapters = chaptersOf(beats, intro, footage);
+  const keywords = [
+    ...story.keywords,
+    ...beats.flatMap((b) => [b.title, b.accent].filter(Boolean)),
+  ];
+
+  // Sound: music bed ducked under speech, one effect per beat, from the local library.
+  const audio = [];
+  const sounds = { music: null, sfx: 0 };
+  if (libraryAvailable()) {
+    if (story.music.enabled) {
+      const rel = story.music.rel || chooseMusic(total);
+      const src = rel && soundPath(rel);
+      if (src && existsSync(src)) {
+        const dest = `assets/music/${assetName(rel)}${extname(src).toLowerCase()}`;
+        linkOrCopy(src, join(comp, dest));
+        const len = mediaDuration(src) || total;
+        const auto = musicAutomation({ intro, footage, total, volume: story.music.volume });
+        // A bed shorter than the film repeats, each pass crossfading 1 s into the next.
+        const XF = 1;
+        for (let k = 0, at = 0; at < total - 0.05 && k < 20; k++, at += len - XF) {
+          const dur = round(Math.min(len, total - at));
+          audio.push({
+            id: k ? `music-${k + 1}` : "music",
+            src: dest,
+            start: round(at),
+            duration: dur,
+            track: 5 + (k % 2 ? -1 : 0),
+            automation: sliceAutomation(auto, at, dur),
+            fadeIn: k ? XF : 0.4,
+            fadeOut: at + len >= total - 0.05 ? 1.5 : XF,
+          });
+        }
+        sounds.music = rel;
+      }
+    }
+    if (story.sfx.enabled) {
+      soundCues(beats, { total }).forEach((c, i) => {
+        const pick = pickSound(c.role, c.seed);
+        const src = pick && soundPath(pick.rel);
+        if (!src || !existsSync(src)) return;
+        const dest = `assets/sfx/${assetName(pick.rel)}${extname(src).toLowerCase()}`;
+        linkOrCopy(src, join(comp, dest));
+        const len = mediaDuration(src) || c.duration;
+        audio.push({
+          id: `sfx-${i + 1}`,
+          src: dest,
+          start: c.start,
+          duration: round(Math.max(0.2, Math.min(c.duration, len))),
+          track: 6 + (i % 3),
+          volume: round(Math.min(1, c.volume * (story.sfx.volume / 0.5))),
+          fadeOut: 0.25,
+        });
+        sounds.sfx++;
+      });
+    }
+  }
+
+  const out = guardedWriter(comp, force);
+  out.add(
+    "index.html",
+    indexHtml({ width, height, duration: total, clips: timelineClips, footage: footageRel, audio }),
   );
-  writeFileSync(
-    join(comp, "compositions", "overlay.html"),
-    overlayHtml({ width, height, duration, brief }),
+  out.add(
+    "compositions/captions.html",
+    captionsHtml({
+      width,
+      height,
+      groups,
+      enabled: brief.captions,
+      keywords,
+      accent: story.theme.accent,
+    }),
   );
+  out.add(
+    "compositions/motion.html",
+    motionHtml({
+      width,
+      height,
+      duration: total,
+      intro,
+      footage,
+      beats,
+      chapters,
+      theme: story.theme,
+      images,
+    }),
+  );
+  const overwritten = out.commit();
+  const legacy = join(comp, "compositions", "overlay.html");
+  if (existsSync(legacy)) unlinkSync(legacy);
   if (!existsSync(join(comp, "hyperframes.json"))) {
     const config = {
       $schema: "https://hyperframes.heygen.com/schema/hyperframes.json",
@@ -374,18 +602,48 @@ export function compose(projectDir, { rebuildEdl = false } = {}) {
 
   const edlOut = {
     generatedAt: new Date().toISOString(),
-    duration,
+    duration: footage,
+    total,
+    intro,
     rows: edl,
     clips: clips.map(({ rows, ...c }) => ({ ...c, sentences: rows.length })),
   };
   writeFileSync(edlPath, JSON.stringify(edlOut, null, 2));
+  writeFileSync(
+    join(projectDir, "timeline.json"),
+    JSON.stringify(
+      {
+        total,
+        intro,
+        footage,
+        outro,
+        clips: timelineClips.map(({ rows, ...c }) => ({ ...c, rows: rows.map((r) => r.id) })),
+        rows: rowTimes(clips, intro),
+        beats,
+        chapters,
+        captions: groups.map((g) => ({
+          start: g.start,
+          end: g.end,
+          text: g.words.map((w) => w.text).join(" "),
+        })),
+        audio: audio.map((a) => ({ id: a.id, src: a.src, start: a.start, duration: a.duration })),
+      },
+      null,
+      2,
+    ),
+  );
   return {
     composition: comp,
-    duration,
+    duration: total,
+    footage,
     clips: clips.length,
     captions: groups.length,
+    beats: beats.filter((b) => !b.hidden).length,
     sentences: edl.length,
     kept: edl.filter((r) => r.keep).length,
+    music: sounds.music,
+    sfx: sounds.sfx,
+    overwritten,
     width,
     height,
     linked,

@@ -108,5 +108,17 @@ Máy Sale chỉ cài app `desktop/`; không cần FFmpeg, HyperFrames hay Claude
 | Phase V7 | Trạng thái |
 |---|---|
 | 1. Source audit | Xong (báo cáo này) |
-| 2. Autonomous pipeline | Đang làm — xong công đoạn 1–3 (nhập, phân tích footage, transcript tiếng Việt chạy thật trên footage Dự án 1) và module giọng đọc Vbee/ElevenLabs; tiếp theo: EDL + smart cut không phá huỷ |
-| 3–9 | Chưa bắt đầu |
+| 2. Autonomous pipeline | Xong cho footage lời nói: nhập → phân tích → transcript tiếng Việt → EDL cắt câu không phá huỷ → AI storyboard → dựng → lint/check → render MP4 (chạy thật trên Dự án 1) |
+| 3. Motion design | Xong bản 1 theo video mẫu “THAODINH V2 – Vịnh Tiên”: hook số liệu, thẻ thông tin, toàn màn hình, bảng số liệu, badge, outro, thanh chương, phụ đề tô từ khoá (`orchestrator/stages/motion.mjs`) |
+| 4. AI storyboard | Xong: Claude Code trên máy đọc câu + brief, viết `story.json` và sửa chữ phụ đề nghe sai; beat có con số không có trong lời nói/brief bị loại (`stages/plan.mjs`) |
+| 5. Âm thanh | Xong bản 1: nhạc nền từ thư viện máy (tự hạ khi có lời, tự lặp nếu ngắn), whoosh/hit/boom/riser theo từng beat |
+| 6. App làm việc | Xong bản 1: quản lý dự án (đổi tên, xoá vào `_trash`), quy trình 6 bước, trình dựng có xem trước trực tiếp (HyperFrames player + proxy H.264), timeline kéo thả, bảng thuộc tính, Claude chat có lịch sử, âm thanh, phong cách, thư viện video/âm thanh |
+| 7–9 (Cloudflare, nhiều người dùng, render worker) | Chưa bắt đầu — cần duyệt tạo tài nguyên Cloudflare và key Claude API |
+
+### Dữ liệu một dự án (`_projects/<id>/`)
+
+- `project.json` nguồn tư liệu, phiên Claude · `brief.json` thông tin đã xác minh, sửa lỗi phụ đề, chất lượng xuất
+- `edl.json` câu nói (giữ/bỏ, sửa chữ) · `story.json` storyboard hiệu ứng (beat gắn vào câu: `row` + `offset`)
+- `timeline.json` vị trí thật của câu, beat, phụ đề, âm thanh (sinh ra, chỉ đọc) · `chat.json` lịch sử Claude
+- `composition/` project HyperFrames sinh tự động; file sửa tay (Studio) được ghi hash và không bị ghi đè nếu không chọn “Ghi đè”
+- `cache/proxy/` bản xem trước H.264 cho player trong app; render luôn đọc footage gốc
