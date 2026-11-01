@@ -18,6 +18,8 @@ import { ingest } from "./stages/ingest.mjs";
 import { writeReport } from "./stages/report.mjs";
 import { transcribeItem } from "./stages/transcribe.mjs";
 import * as voice from "../voice/index.mjs";
+import { compose } from "./stages/compose.mjs";
+import { render, validate } from "./stages/render.mjs";
 
 function args(argv) {
   const out = { _: [] };
@@ -94,6 +96,23 @@ if (isMain) {
       if (!a.project) throw new Error("Cần --project");
       for (const [name, s] of Object.entries(status(a.project).stages))
         console.log(`${s.status.padEnd(8)} ${name}${s.error ? ` — ${s.error}` : ""}`);
+    } else if (cmd === "compose") {
+      if (!a.project) throw new Error("Cần --project");
+      const pipe = new Pipeline(resolve(a.project));
+      const r = await pipe.stage("compose", { at: Date.now() }, async () =>
+        compose(resolve(a.project), { rebuildEdl: Boolean(a["rebuild-edl"]) }),
+      );
+      console.log(JSON.stringify(r.output, null, 2));
+    } else if (cmd === "validate") {
+      if (!a.project) throw new Error("Cần --project");
+      console.log(JSON.stringify(await validate(join(resolve(a.project), "composition")), null, 2));
+    } else if (cmd === "render") {
+      if (!a.project) throw new Error("Cần --project");
+      const pipe = new Pipeline(resolve(a.project));
+      const r = await pipe.stage("render", { at: Date.now() }, () =>
+        render(resolve(a.project), { name: a.name || "final", onLog: (l) => console.log(l) }),
+      );
+      console.log(JSON.stringify(r.output, null, 2));
     } else if (cmd === "voice-status") {
       console.log(JSON.stringify(voice.status(), null, 2));
     } else if (cmd === "voices") {

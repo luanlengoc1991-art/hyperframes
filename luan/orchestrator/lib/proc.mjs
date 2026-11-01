@@ -1,7 +1,7 @@
 // Run external tools (ffmpeg, ffprobe, the HyperFrames CLI) and find them on this machine.
 import { spawn } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 
 const IS_WIN = process.platform === "win32";
 
@@ -58,9 +58,43 @@ export function requireTool(name) {
   return path;
 }
 
-/** `npx hyperframes <args>`; npx is a .cmd on Windows, so it needs a shell and quoted arguments. */
+/**
+ * The first complete JSON object in mixed CLI output (logs may come before or after it).
+ * Returns null when there is none.
+ */
+export function firstJsonObject(text) {
+  const s = String(text || "");
+  for (let i = s.indexOf("{"); i >= 0; i = s.indexOf("{", i + 1)) {
+    let depth = 0;
+    let inStr = false;
+    let escaped = false;
+    for (let j = i; j < s.length; j++) {
+      const ch = s[j];
+      if (inStr) {
+        if (escaped) escaped = false;
+        else if (ch === "\\") escaped = true;
+        else if (ch === '"') inStr = false;
+      } else if (ch === '"') inStr = true;
+      else if (ch === "{") depth++;
+      else if (ch === "}" && --depth === 0) {
+        try {
+          return JSON.parse(s.slice(i, j + 1));
+        } catch {
+          break;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// npx ships with Node as a script; running it with this Node avoids a shell (npx is a .cmd on Windows).
+const NPX_CLI = join(dirname(process.execPath), "node_modules", "npm", "bin", "npx-cli.js");
+
+/** `npx hyperframes <args>`, without a shell, so arguments with spaces or quotes pass through intact. */
 export function hyperframes(args, opts = {}) {
   const all = ["--yes", "hyperframes", ...args];
+  if (existsSync(NPX_CLI)) return run(process.execPath, [NPX_CLI, ...all], opts);
   if (!IS_WIN) return run("npx", all, opts);
   const quoted = all.map((a) => (/[\s"&|<>^]/.test(a) ? `"${a.replace(/"/g, '""')}"` : a));
   return run("npx", quoted, { ...opts, shell: true });

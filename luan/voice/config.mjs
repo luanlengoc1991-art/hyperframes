@@ -4,7 +4,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const ENV_FILE = join(dirname(fileURLToPath(import.meta.url)), "..", ".env.local");
+// LUAN_ENV_FILE lets tests point at a scratch file instead of the real secrets.
+export const ENV_FILE =
+  process.env.LUAN_ENV_FILE || join(dirname(fileURLToPath(import.meta.url)), "..", ".env.local");
 
 let loaded = false;
 export function loadEnv(file = ENV_FILE) {
