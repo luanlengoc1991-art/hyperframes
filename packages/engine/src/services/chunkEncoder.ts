@@ -6,6 +6,7 @@
  * Supports CPU (libx264) and GPU encoding.
  */
 
+import { frameSequencePath } from "./extractedFrameIndex.js";
 import {
   closeSync,
   copyFileSync,
@@ -20,7 +21,7 @@ import {
   writeFileSync,
   writeSync,
 } from "fs";
-import { join, dirname, extname } from "path";
+import { join, dirname, extname, resolve } from "path";
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
 import {
   type GpuEncoder,
@@ -46,6 +47,7 @@ import { extractAudioMetadata } from "../utils/ffprobe.js";
 import { type Fps, fpsToFfmpegArg, fpsToNumber } from "@hyperframes/core";
 import type { EncoderOptions, EncodeResult, MuxResult } from "./chunkEncoder.types.js";
 import { appendVp9CpuUsedArg } from "./vp9Options.js";
+import { appendSoftwareEncoderThreadsArg } from "./softwareEncoderThreads.js";
 import { appendRenderProvenanceArgs } from "../utils/renderProvenance.js";
 
 export type { EncoderOptions, EncodeResult, MuxResult } from "./chunkEncoder.types.js";
@@ -66,16 +68,10 @@ export interface EncoderPreset {
 
 function appendEncodeTimeoutMessage(error: string, timedOut: boolean, timeoutMs: number): string {
   if (!timedOut) return error;
-  // Two independent reports of this exact timeout, both resolved by env vars
-  // that already exist but aren't named anywhere the user would see them at
-  // the point of failure — they had to go find FFMPEG_ENCODE_TIMEOUT_MS and
-  // PRODUCER_ENABLE_CHUNKED_ENCODE themselves. Name both here instead of
-  // just stating what happened.
   return (
-    `${error}\nFFmpeg killed after exceeding ffmpegEncodeTimeout (${timeoutMs} ms). ` +
-    "Long or high-frame-count renders may need more time: set FFMPEG_ENCODE_TIMEOUT_MS " +
-    "to a higher value (ms), or set PRODUCER_ENABLE_CHUNKED_ENCODE=true to encode in " +
-    "smaller chunks instead of one long-running ffmpeg process."
+    `${error}\nFFmpeg killed after writing no new frame for ffmpegEncodeTimeout (${timeoutMs} ms). ` +
+    "An encode that is still writing frames is never stopped; if this encoder legitimately " +
+    "pauses longer between frames, raise FFMPEG_ENCODE_TIMEOUT_MS (ms)."
   );
 }
 
@@ -229,6 +225,43 @@ export function lockedGopCodecParams(codec: "h264" | "h265", gopSize: number): s
   return codec === "h264" ? shared : `keyint=${gopSize}:min-keyint=${gopSize}:${shared}`;
 }
 
+/** Frames per keyframe interval: the nearest whole frame, never below one. */
+export function keyframeIntervalToGopSize(fps: Fps, seconds: number): number {
+  return Math.max(1, Math.round(fpsToNumber(fps) * seconds));
+}
+
+const BITRATE_PATTERN = /^(\d+(?:\.\d+)?)([kKmMgG]?)$/;
+
+function bitrateToBitsPerSecond(value: string): number {
+  const match = BITRATE_PATTERN.exec(value);
+  if (!match) throw new Error(`[chunkEncoder] invalid bitrate ${JSON.stringify(value)}`);
+  const unit = match[2]!.toLowerCase();
+  const scale = { g: 1_000_000_000, m: 1_000_000, k: 1_000 }[unit] ?? 1;
+  return Number(match[1]) * scale;
+}
+
+/** `-maxrate` / `-bufsize` for the VBV cap, written once for both arg builders. Buffer defaults to 2x. */
+export function appendRateCapArgs(
+  args: string[],
+  options: { codec?: string; maxBitrate?: string; bufferSize?: string },
+): void {
+  const { maxBitrate, bufferSize } = options;
+  if (maxBitrate === undefined) {
+    if (bufferSize !== undefined) throw new Error("[chunkEncoder] bufferSize requires maxBitrate");
+    return;
+  }
+  const codec = options.codec ?? "h264";
+  if (codec !== "h264" && codec !== "h265") {
+    throw new Error(`[chunkEncoder] maxBitrate is not supported for codec ${codec}`);
+  }
+  const cap = bitrateToBitsPerSecond(maxBitrate);
+  const buffer = bufferSize !== undefined ? bitrateToBitsPerSecond(bufferSize) : cap * 2;
+  if (cap <= 0 || buffer <= 0) {
+    throw new Error("[chunkEncoder] maxBitrate and bufferSize must be positive");
+  }
+  args.push("-maxrate", String(Math.round(cap)), "-bufsize", String(Math.round(buffer)));
+}
+
 export function buildEncoderArgs(
   options: EncoderOptions,
   inputArgs: string[],
@@ -261,6 +294,7 @@ export function buildEncoderArgs(
   // Without -xerror, ffmpeg ends the video at the first frame file it cannot read and still exits 0.
   const args: string[] = ["-xerror", ...inputArgs, "-r", fpsToFfmpegArg(fps)];
   const shouldUseGpu = useGpu && gpuEncoder !== null;
+  appendRateCapArgs(args, options);
 
   if (codec === "h264" || codec === "h265") {
     if (shouldUseGpu) {
@@ -325,6 +359,7 @@ export function buildEncoderArgs(
     } else {
       const encoderName = codec === "h264" ? "libx264" : "libx265";
       args.push("-c:v", encoderName, "-preset", preset);
+      appendSoftwareEncoderThreadsArg(args, encoderName);
       if (bitrate) args.push("-b:v", bitrate);
       else args.push("-crf", String(quality));
 
@@ -566,7 +601,7 @@ export async function encodeFramesFromDir(
     gpuEncoder = await getCachedGpuEncoder();
   }
 
-  const inputPath = join(framesDir, framePattern);
+  const inputPath = frameSequencePath(framesDir, framePattern);
   const inputArgs = ["-framerate", fpsToFfmpegArg(options.fps), "-i", inputPath];
   const args = buildEncoderArgs(options, inputArgs, outputPath, gpuEncoder);
   const encodeTimeout = config?.ffmpegEncodeTimeout ?? DEFAULT_CONFIG.ffmpegEncodeTimeout;
@@ -599,7 +634,7 @@ export async function encodeFramesFromDir(
       error: appendEncodeTimeoutMessage(
         frameReadFailure(result.stderr, framePattern, 0, framesRead, frameCount) +
           formatFfmpegError(result.exitCode, result.stderr),
-        result.terminationReason === "deadline",
+        result.terminationReason === "inactivity",
         encodeTimeout,
       ),
       failureReason: isExternalFfmpegInterruption(result) ? "external_interruption" : undefined,
@@ -634,7 +669,7 @@ let concatListSeq = 0;
 function writeConcatList(dir: string, inputPaths: readonly string[]): string {
   concatListSeq += 1;
   const listPath = join(dir, `concat-list-${process.pid}-${concatListSeq}.txt`);
-  const body = inputPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join("\n");
+  const body = inputPaths.map((p) => `file '${resolve(p).replace(/'/g, "'\\''")}'`).join("\n");
   writeFileSync(listPath, body, "utf-8");
   return listPath;
 }
@@ -673,7 +708,7 @@ export async function concatVideoFiles(
     success: false,
     error: appendEncodeTimeoutMessage(
       `Chunk concat failed: ${result.stderr.slice(-400)}`,
-      result.terminationReason === "deadline",
+      result.terminationReason === "inactivity",
       encodeTimeout,
     ),
     externalInterruption: isExternalFfmpegInterruption(result),
@@ -731,7 +766,7 @@ export async function encodeFramesChunkedConcat(
         ? ".mov"
         : ".mp4";
     const chunkPath = join(chunkDir, `chunk_${String(i).padStart(4, "0")}${ext}`);
-    const inputPath = join(framesDir, framePattern);
+    const inputPath = frameSequencePath(framesDir, framePattern);
     const inputArgs = [
       "-framerate",
       fpsToFfmpegArg(options.fps),
@@ -767,7 +802,7 @@ export async function encodeFramesChunkedConcat(
               framesRead,
               framesInChunk,
             ) + `Chunk ${i} encode failed: ${processResult.stderr.slice(-400)}`,
-            processResult.terminationReason === "deadline",
+            processResult.terminationReason === "inactivity",
             encodeTimeout,
           ),
     };

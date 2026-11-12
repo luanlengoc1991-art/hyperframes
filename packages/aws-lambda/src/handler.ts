@@ -121,6 +121,11 @@ export interface HandlerDeps {
  * shape; unwrap until we hit a discriminated event.
  */
 export async function handler(event: LambdaEvent, deps?: HandlerDeps): Promise<LambdaResult> {
+  if ((event as { Action?: unknown }).Action === "warm") {
+    primeRuntimeEnv();
+    await ensureChromePath(deps);
+    return { Action: "warm" };
+  }
   const unwrapped = unwrapEvent(event);
   validatePlanProtocolShape(unwrapped);
   validateEventS3Uris(unwrapped);
@@ -566,7 +571,7 @@ async function handleAudio(event: AudioEvent, deps?: HandlerDeps): Promise<Audio
     AudioS3Uri: null,
     DurationMs: Date.now() - started,
   });
-  // The plan mixed it (non-mp4, cfr): the assembler reads it from the manifest.
+  // The plan mixed it (png-sequence, cfr): the assembler reads it from the manifest.
   if (!plansSeparateAudio(event.Config, { deferAudio: true })) return none();
   const s3 = deps?.s3 ?? getS3Client();
   await ensureChromePath(deps);
@@ -615,7 +620,9 @@ async function handleRenderChunk(
   const started = Date.now();
   const s3 = deps?.s3 ?? getS3Client();
   const primitive = deps?.primitives?.renderChunk ?? renderChunk;
+  const chromeStarted = Date.now();
   await ensureChromePath(deps);
+  const chromeMs = Date.now() - chromeStarted;
 
   const work = mkdtempSync(join(deps?.tmpRoot ?? tmpdir(), "hf-lambda-chunk-"));
   const planTar = join(work, "plan.tar.gz");
@@ -640,14 +647,17 @@ async function handleRenderChunk(
         : `chunk-${pad(event.ChunkIndex)}${formatExtension(event.Format)}`,
     );
 
+    const primitiveStarted = Date.now();
     const result: ChunkResult = await primitive(planDir, event.ChunkIndex, chunkOutputBase, {
       maxCaptureWorkers: lambdaMaxCaptureWorkers(),
+      interleaveCapture: true,
     });
     logEvent({
       event: "chunk_capture",
       chunkIndex: event.ChunkIndex,
       workers: result.workers,
       captureMode: result.captureMode,
+      ...chunkStageTimings(result, primitiveStarted - started, chromeMs),
     });
 
     const chunkUri = await uploadChunkOutput(
@@ -681,7 +691,9 @@ async function handleRenderChunkV2(
   const started = Date.now();
   const s3 = deps?.s3 ?? getS3Client();
   const primitive = deps?.primitives?.renderChunk ?? renderChunk;
+  const chromeStarted = Date.now();
   await ensureChromePath(deps);
+  const chromeMs = Date.now() - chromeStarted;
   const work = mkdtempSync(join(deps?.tmpRoot ?? tmpdir(), "hf-lambda-chunk-v2-"));
   try {
     const { planDir } = await downloadAndMaterializePlanV2(
@@ -696,14 +708,17 @@ async function handleRenderChunkV2(
         ? `chunk-${pad(event.ChunkIndex)}`
         : `chunk-${pad(event.ChunkIndex)}${formatExtension(event.Format)}`,
     );
+    const primitiveStarted = Date.now();
     const result = await primitive(planDir, event.ChunkIndex, chunkOutputBase, {
       maxCaptureWorkers: lambdaMaxCaptureWorkers(),
+      interleaveCapture: true,
     });
     logEvent({
       event: "chunk_capture",
       chunkIndex: event.ChunkIndex,
       workers: result.workers,
       captureMode: result.captureMode,
+      ...chunkStageTimings(result, primitiveStarted - started, chromeMs),
     });
     const chunkUri = await uploadChunkOutput(
       s3,
@@ -723,6 +738,19 @@ async function handleRenderChunkV2(
   } finally {
     cleanupDir(work);
   }
+}
+
+function chunkStageTimings(result: ChunkResult, setupMs: number, chromeMs: number) {
+  const { planHashMs, sessionBootMs, captureStageMs, encodeStageMs, durationMs } = result;
+  return {
+    setupMs,
+    chromeMs,
+    planHashMs,
+    sessionBootMs,
+    captureStageMs,
+    encodeStageMs,
+    durationMs,
+  };
 }
 
 async function uploadChunkOutput(
@@ -835,7 +863,11 @@ async function handleAssembleV2(
     }
     // `downloadAndMaterializePlanV2` materializes atomically. Audio is
     // assembler-only and lives at the familiar v1-compatible location.
-    const audioPath = resolvePlanAudioPath(planDir);
+    let audioPath = resolvePlanAudioPath(planDir);
+    if (event.AudioS3Uri !== null) {
+      audioPath = join(planDir, PLAN_AUDIO_RELATIVE_PATH);
+      await downloadS3ObjectToFile(s3, event.AudioS3Uri, audioPath);
+    }
     const chunksStarted = Date.now();
     const chunkPaths = await downloadChunkObjects(s3, event.ChunkS3Uris, work, event.Format);
     const chunksMs = Date.now() - chunksStarted;

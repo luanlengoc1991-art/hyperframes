@@ -14,7 +14,9 @@ import type { DistributedFormat } from "@hyperframes/aws-lambda/sdk";
 import { type CanvasResolution, DISTRIBUTED_FPS, isDistributedFps } from "@hyperframes/core";
 import { parseOutputResolutionFlag } from "../utils/parseOutputResolution.js";
 import type { Example } from "./_examples.js";
+import type { VideoArch } from "./lambda/videoImage.js";
 import { c } from "../ui/colors.js";
+import { deliveryFlagArgs, parseDeliveryFlags } from "../utils/deliveryFlags.js";
 import { defaultCloudFps } from "../utils/compositionFps.js";
 import { isMissingPackageError, missingPackageMessage } from "../utils/missingPackage.js";
 
@@ -120,12 +122,29 @@ export default defineCommand({
       description: "sparticuz | chrome-headless-shell (default: sparticuz)",
     },
     memory: { type: "string", description: "Lambda memory MB (default: 10240)" },
+    "video-arch": {
+      type: "string",
+      description:
+        "arm64 | x86_64: where the plan and chunks run; arm64 adds a container-image function (default: arm64)",
+    },
     "skip-build": { type: "boolean", description: "Reuse existing handler.zip (deploy)" },
+    warm: {
+      type: "boolean",
+      default: true,
+      description: "Warm the video function once after deploy (--no-warm skips it)",
+    },
 
     // sites / render
     "site-id": { type: "string", description: "Explicit site id (overrides content hash)" },
-    width: { type: "string", description: "Render width in pixels" },
-    height: { type: "string", description: "Render height in pixels" },
+    width: {
+      type: "string",
+      description:
+        "Output width in pixels: the composition's width, or a whole-number multiple of it (3840 on a 1920x1080 composition renders at scale 2)",
+    },
+    height: {
+      type: "string",
+      description: "Output height in pixels, at the same multiple as --width",
+    },
     "output-resolution": {
       type: "string",
       description:
@@ -135,6 +154,7 @@ export default defineCommand({
     format: { type: "string", description: "mp4 | mov | png-sequence | webm (default: mp4)" },
     codec: { type: "string", description: "h264 | h265 (mp4 only)" },
     quality: { type: "string", description: "draft | standard | high" },
+    ...deliveryFlagArgs,
     "chunk-size": {
       type: "string",
       description:
@@ -258,7 +278,9 @@ export default defineCommand({
           reservedConcurrency: parseReservedConcurrency(args.concurrency),
           chromeSource: parseChromeSource(args["chrome-source"]),
           lambdaMemoryMb: parsePositiveInt(args.memory, "--memory"),
+          videoArch: parseVideoArch(args["video-arch"]),
           skipBuild: Boolean(args["skip-build"]),
+          warm: args.warm !== false,
         });
         return;
       }
@@ -320,6 +342,7 @@ export default defineCommand({
           format: parseFormat(args.format),
           codec: parseCodec(args.codec),
           quality: parseQuality(args.quality),
+          ...parseDeliveryFlags(args),
           chunkSize: parsePositiveInt(args["chunk-size"], "--chunk-size"),
           maxParallelChunks: parsePositiveInt(args["max-parallel-chunks"], "--max-parallel-chunks"),
           targetChunkFrames: parsePositiveInt(args["target-chunk-frames"], "--target-chunk-frames"),
@@ -377,6 +400,7 @@ export default defineCommand({
           format: parseFormat(args.format),
           codec: parseCodec(args.codec),
           quality: parseQuality(args.quality),
+          ...parseDeliveryFlags(args),
           chunkSize: parsePositiveInt(args["chunk-size"], "--chunk-size"),
           maxParallelChunks: parsePositiveInt(args["max-parallel-chunks"], "--max-parallel-chunks"),
           targetChunkFrames: parsePositiveInt(args["target-chunk-frames"], "--target-chunk-frames"),
@@ -483,6 +507,9 @@ const parseQuality = (raw: unknown): (typeof QUALITIES)[number] | undefined =>
   parseEnum(raw, QUALITIES, "[lambda render] --quality", undefined);
 const parseChromeSource = (raw: unknown): (typeof CHROME_SOURCES)[number] =>
   parseEnum(raw, CHROME_SOURCES, "[lambda deploy] --chrome-source", "sparticuz")!;
+const VIDEO_ARCHS = ["x86_64", "arm64"] as const satisfies readonly VideoArch[];
+const parseVideoArch = (raw: unknown): (typeof VIDEO_ARCHS)[number] | undefined =>
+  parseEnum(raw, VIDEO_ARCHS, "[lambda deploy] --video-arch", undefined);
 
 /**
  * Lambda flavor of the shared {@link parseOutputResolutionFlag} — same wire

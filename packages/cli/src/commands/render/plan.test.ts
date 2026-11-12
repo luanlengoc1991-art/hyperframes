@@ -124,6 +124,18 @@ describe("createRenderPlan", () => {
     vi.unstubAllEnvs();
   });
 
+  it.each([undefined, "off"])("preserves page motion blur override %s", (value) => {
+    expect(createRenderPlan({ dir: projectDir, "page-motion-blur": value }).pageMotionBlur).toBe(
+      value,
+    );
+  });
+
+  it.each(["", "on", "false", "OFF"])("rejects unsupported page motion blur value %s", (value) => {
+    expect(() => createRenderPlan({ dir: projectDir, "page-motion-blur": value })).toThrow(
+      CliUsageError,
+    );
+  });
+
   it("preserves an aspect-agnostic resolution alias through the execution plan", () => {
     const plan = createRenderPlan({ dir: projectDir, resolution: "1080p" });
     expect(plan.outputResolution).toBe("landscape");
@@ -217,6 +229,19 @@ describe("createRenderPlan", () => {
     expect(
       createRenderPlan({ dir: projectDir, format: "webm", "video-bitrate": "10M" }).videoBitrate,
     ).toBe("10M");
+  });
+
+  it("carries the delivery options into the plan for MP4 and refuses them for other formats", () => {
+    const flags = { "keyframe-interval": "2", "max-bitrate": "8M", "buffer-size": "12M" };
+    expect(createRenderPlan({ dir: projectDir, format: "mp4", ...flags })).toMatchObject({
+      keyframeIntervalSeconds: 2,
+      maxBitrate: "8M",
+      bufferSize: "12M",
+    });
+    expect(createRenderPlan({ dir: projectDir }).maxBitrate).toBeUndefined();
+    for (const format of ["webm", "mov", "gif", "hls"]) {
+      expect(() => createRenderPlan({ dir: projectDir, format, ...flags })).toThrow(CliUsageError);
+    }
   });
 
   it("rejects batch and single-render variables before execution", () => {

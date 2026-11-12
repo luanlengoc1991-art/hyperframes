@@ -46,9 +46,15 @@ import {
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
 import { fpsToFfmpegArg, fpsToNumber, type Fps } from "@hyperframes/core";
 import { appendVp9CpuUsedArg } from "./vp9Options.js";
+import { appendSoftwareEncoderThreadsArg } from "./softwareEncoderThreads.js";
 import { appendRenderProvenanceArgs } from "../utils/renderProvenance.js";
 
-import { appendLockedGopArgs, lockedGopCodecParams, resolveLockedGopSize } from "./chunkEncoder.js";
+import {
+  appendLockedGopArgs,
+  appendRateCapArgs,
+  lockedGopCodecParams,
+  resolveLockedGopSize,
+} from "./chunkEncoder.js";
 
 // Re-export EncoderOptions so callers can reference the type via this module.
 export type { EncoderOptions } from "./chunkEncoder.types.js";
@@ -156,6 +162,8 @@ export interface StreamingEncoderOptions {
   preset?: string;
   quality?: number;
   bitrate?: string;
+  maxBitrate?: string;
+  bufferSize?: string;
   pixelFormat?: string;
   /** libvpx-vp9 -cpu-used value. Defaults to the engine VP9 setting. */
   vp9CpuUsed?: number;
@@ -280,6 +288,7 @@ export function buildStreamingArgs(
   args.push("-r", fpsToFfmpegArg(fps));
 
   const shouldUseGpu = useGpu && gpuEncoder !== null;
+  appendRateCapArgs(args, options);
 
   if (codec === "h264" || codec === "h265") {
     if (shouldUseGpu) {
@@ -338,6 +347,7 @@ export function buildStreamingArgs(
     } else {
       const encoderName = codec === "h264" ? "libx264" : "libx265";
       args.push("-c:v", encoderName, "-preset", preset);
+      appendSoftwareEncoderThreadsArg(args, encoderName);
       if (bitrate) args.push("-b:v", bitrate);
       else args.push("-crf", String(quality));
 

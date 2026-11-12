@@ -18,16 +18,20 @@ import {
   type VideoFrameFormat,
 } from "@hyperframes/engine";
 import { errorBox } from "../../ui/format.js";
+import { parseDeliveryFlags } from "../../utils/deliveryFlags.js";
+import { parseEnumFlag } from "../../cloud/parsing.js";
 import { failUsage } from "../../utils/commandResult.js";
 import { resolveProject } from "../../utils/project.js";
 import {
-  hasExplicitCompositionArg,
   parseGifLoopArg,
   parseHlsSegmentSecondsArg,
   resolveBrowserTimeoutMsArg,
-  resolveCompositionEntryArg,
   resolveDefaultFpsArg,
 } from "../../utils/renderArgs.js";
+import {
+  hasExplicitCompositionArg,
+  resolveCompositionEntryArg,
+} from "../../utils/compositionEntry.js";
 import { normalizeSkillSlug } from "../../telemetry/skill.js";
 import { loadProjectConfig } from "../../utils/projectConfig.js";
 import { type CatalogUsage, summarizeCatalogUsage } from "../../utils/catalogUsage.js";
@@ -73,12 +77,16 @@ export interface RenderCommandArgs {
   "gif-loop"?: string;
   "hls-segment-seconds"?: string;
   "video-frame-format"?: string;
+  "page-motion-blur"?: string;
   workers?: string;
   docker?: boolean;
   hdr?: boolean;
   sdr?: boolean;
   crf?: string;
   "video-bitrate"?: string;
+  "keyframe-interval"?: string;
+  "max-bitrate"?: string;
+  "buffer-size"?: string;
   "vp9-cpu-used"?: string;
   gpu?: boolean;
   "browser-gpu"?: boolean;
@@ -126,6 +134,7 @@ export interface RenderPlan {
   /** HLS target segment length in seconds; only set for `format: "hls"`. */
   hlsSegmentSeconds?: number;
   videoFrameFormat: VideoFrameFormat;
+  pageMotionBlur?: "off";
   outputResolution?: CanvasResolution;
   outputResolutionAspectAgnostic: boolean;
   outputResolutionRaw?: string;
@@ -156,6 +165,9 @@ export interface RenderPlan {
   crf?: number;
   vp9CpuUsed?: number;
   videoBitrate?: string;
+  keyframeIntervalSeconds?: number;
+  maxBitrate?: string;
+  bufferSize?: string;
   hdrMode: HdrMode;
   pageSideCompositing: boolean;
   experimentalFastCapture: boolean;
@@ -224,6 +236,9 @@ function resolveHfEnvOverrides(): readonly string[] {
 /** Parse and validate command input into an immutable execution plan. */
 // fallow-ignore-next-line complexity
 export function createRenderPlan(args: RenderCommandArgs, now = new Date()): RenderPlan {
+  const pageMotionBlur = parseEnumFlag(args["page-motion-blur"], ["off"] as const, {
+    flag: "--page-motion-blur",
+  });
   const hfEnvOverrides = resolveHfEnvOverrides();
   const hasExplicitComposition = hasExplicitCompositionArg(args.composition);
   const project = resolveProject(args.dir, { requireIndex: !hasExplicitComposition });
@@ -509,6 +524,16 @@ export function createRenderPlan(args: RenderCommandArgs, now = new Date()): Ren
     failUsage();
   }
 
+  const delivery = parseDeliveryFlags(args);
+  if (Object.keys(delivery).length > 0 && format !== "mp4") {
+    errorBox(
+      "Delivery options apply to MP4",
+      "--keyframe-interval, --max-bitrate and --buffer-size set how the MP4 encoder delivers the file.",
+      "Remove them, or render --format mp4.",
+    );
+    failUsage();
+  }
+
   const quiet = args.quiet ?? false;
   const batchJson = args.json ?? false;
   return Object.freeze({
@@ -526,6 +551,7 @@ export function createRenderPlan(args: RenderCommandArgs, now = new Date()): Ren
     gifFpsCapped,
     hlsSegmentSeconds,
     videoFrameFormat: videoFrameFormatRaw,
+    pageMotionBlur,
     outputResolution,
     outputResolutionAspectAgnostic,
     outputResolutionRaw: args.resolution,
@@ -554,6 +580,7 @@ export function createRenderPlan(args: RenderCommandArgs, now = new Date()): Ren
     crf,
     vp9CpuUsed,
     videoBitrate,
+    ...delivery,
     hdrMode: args.sdr ? "force-sdr" : args.hdr ? "force-hdr" : "auto",
     pageSideCompositing: args["page-side-compositing"] !== false,
     experimentalFastCapture: args["experimental-fast-capture"] === true,

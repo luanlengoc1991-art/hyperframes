@@ -2,6 +2,7 @@
 title: "Install and update agent skills"
 sidebarTitle: "Agent skills"
 description: "Teach a coding agent how to create valid HyperFrames projects."
+keywords: ['npx skills', 'npx skills add', 'skills add', 'install skills', 'update skills']
 ---
 
 import { DocsVideo } from "/snippets/docs-video.jsx";
@@ -28,6 +29,12 @@ Run the interactive installer:
 ```bash
 npx skills add heygen-com/hyperframes
 ```
+
+Run this command from your video project's directory. If you cloned HyperFrames
+to contribute, use `npx hyperframes skills update` for a global install from that
+checkout, or run the project installer in a separate video project. Project-local
+installer targets can overlap the checkout's tracked `skills/` source and
+overwrite uncommitted edits.
 
 Select **Core Skills**. That covers every kind of video; the other skills install when a request needs them, so you do not need the full catalog up front.
 

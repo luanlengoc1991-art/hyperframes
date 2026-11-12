@@ -79,7 +79,11 @@ import type {
   HyperframesRenderDetail,
 } from "../../cloud/index.js";
 import { isAbsolute, relative, resolve as resolvePath } from "node:path";
-import { existsSync } from "node:fs";
+import { statSync } from "node:fs";
+import {
+  compositionEntryErrorMessage,
+  parseCompositionEntryArg,
+} from "../../utils/compositionEntry.js";
 
 const VALID_QUALITY = ["draft", "standard", "high"] as const;
 const VALID_FORMAT = ["mp4", "webm", "mov"] as const;
@@ -118,6 +122,11 @@ export default defineCommand({
     fps: { type: "string", description: "Frames per second (1-240). Default: 30." },
     quality: { type: "string", description: "draft | standard | high (default: standard)" },
     format: { type: "string", description: "mp4 | webm | mov (default: mp4)" },
+    "page-motion-blur": {
+      type: "string",
+      description:
+        "Set off to disable authored page motion blur. Omit to keep the current cloud behavior.",
+    },
     resolution: {
       type: "string",
       description: "Resolution tier: 1080p | 4k (default: 1080p; 4k is billed at 1.5x)",
@@ -214,6 +223,9 @@ export default defineCommand({
     const fps = parseIntFlag(args.fps, { flag: "--fps", min: 1, max: 240 });
     const quality = parseEnumFlag(args.quality, VALID_QUALITY, { flag: "--quality" });
     const format = parseEnumFlag(args.format, VALID_FORMAT, { flag: "--format" });
+    const pageMotionBlur = parseEnumFlag(args["page-motion-blur"], ["off"] as const, {
+      flag: "--page-motion-blur",
+    });
     const resolution = parseEnumFlag(args.resolution, VALID_RESOLUTION, {
       flag: "--resolution",
     });
@@ -259,6 +271,7 @@ export default defineCommand({
       args["variables-file"],
       args["strict-variables"] ?? false,
       project,
+      args.composition,
     );
 
     const client = await createCloudClient();
@@ -282,6 +295,7 @@ export default defineCommand({
       quality,
       format,
       resolution,
+      pageMotionBlur,
       aspectRatio,
       composition: args.composition,
       variables,
@@ -452,17 +466,14 @@ export function resolveAspectRatioForSubmit(
   }
 
   const dir = project.dir ?? ".";
-  const entryRelative = compositionArg ?? "index.html";
-  const entryPath = resolvePath(dir, entryRelative);
-
-  if (!existsSync(entryPath)) {
-    errorBox(
-      "Composition not found",
-      `Entry file "${entryRelative}" does not exist in ${dir}.`,
-      "Pass --composition with a path that exists inside the project, or omit it to use index.html.",
-    );
+  const entry = parseCompositionEntryArg(compositionArg ?? "index.html", dir, statSync);
+  if (!entry.ok) {
+    const { title, message, hint } = compositionEntryErrorMessage(entry.error);
+    errorBox(title, message, hint);
     failCommand();
   }
+  const entryRelative = entry.value ?? "index.html";
+  const entryPath = resolvePath(dir, entryRelative);
 
   const detection = detectAspectRatioFromHtml(entryPath);
 
@@ -528,6 +539,7 @@ function resolveVariablesAndValidateIfLocal(
   filePath: string | undefined,
   strict: boolean,
   source: ProjectInputSource,
+  composition: string | undefined,
 ): Record<string, unknown> | undefined {
   const variables = resolveVariablesArg(inline, filePath);
   if (!variables || Object.keys(variables).length === 0) return variables;
@@ -536,11 +548,9 @@ function resolveVariablesAndValidateIfLocal(
   // lives on the server side, so we send the variables as-is and let
   // the API surface any mismatch via `hyperframes_project_invalid`.
   if (source.kind !== "dir") return variables;
-  // `resolveProject` calls process.exit on a missing/invalid dir, so
-  // there's no need to wrap this in try/catch — if it returns, the
-  // index.html is present. The earlier impl had a dead try/catch.
-  const { indexPath } = resolveProject(source.dir);
-  const issues = validateVariablesAgainstProject(indexPath, variables);
+  const project = resolveProject(source.dir);
+  const entryPath = resolvePath(project.dir, composition ?? "index.html");
+  const issues = validateVariablesAgainstProject(entryPath, variables);
   reportVariableIssues(issues, { strict, quiet: false });
   return variables;
 }
@@ -653,9 +663,8 @@ async function offloadMedia(
       apiBaseUrl: resolveCloudBaseUrl(),
       upload,
       entryPath,
-      onFile: asJson
-        ? undefined
-        : (item) => console.log(c.dim(`   ${describeOffload(item, !upload)}`)),
+      onFile: (item) =>
+        (asJson ? console.error : console.log)(c.dim(`   ${describeOffload(item, !upload)}`)),
     });
   } catch (err) {
     reportApiError("Media upload failed", err);
@@ -802,6 +811,7 @@ interface SubmitOptions {
   fps: number | undefined;
   quality: "draft" | "standard" | "high" | undefined;
   format: "mp4" | "webm" | "mov" | undefined;
+  pageMotionBlur: NonNullable<CreateHyperframesRenderRequest["page_motion_blur"]> | undefined;
   resolution: CreateHyperframesRenderRequest["resolution"] | undefined;
   aspectRatio: CreateHyperframesRenderRequest["aspect_ratio"] | undefined;
   composition: string | undefined;
@@ -830,6 +840,7 @@ function buildRenderBody(opts: SubmitOptions): CreateHyperframesRenderRequest {
   if (opts.fps !== undefined) body.fps = opts.fps;
   if (opts.quality !== undefined) body.quality = opts.quality;
   if (opts.format !== undefined) body.format = opts.format;
+  if (opts.pageMotionBlur !== undefined) body.page_motion_blur = opts.pageMotionBlur;
   if (opts.resolution !== undefined) body.resolution = opts.resolution;
   if (opts.aspectRatio !== undefined) body.aspect_ratio = opts.aspectRatio;
   if (opts.composition !== undefined) body.composition = opts.composition;
